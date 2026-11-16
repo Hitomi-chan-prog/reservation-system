@@ -1,20 +1,15 @@
 "use strict";
 
-// STEP 1: 固定の見本データ。ICSや入力内容から予定・予約を作成しません。
 const byId = (id) => document.getElementById(id);
-const today = new Date();
-const startOfWeek = (date) => {
-  const monday = new Date(date.getFullYear(), date.getMonth(), date.getDate());
-  monday.setDate(monday.getDate() - (monday.getDay() + 6) % 7);
-  return monday;
-};
+const today = Calendar.today();
+const startOfWeek = Calendar.startOfWeek;
 let displayedMonday = startOfWeek(today);
-const dateAt = (day) => {
-  const date = new Date(displayedMonday);
-  date.setDate(date.getDate() + day);
-  return date;
-};
-const shortDate = (date) => `${date.getMonth() + 1}/${date.getDate()}`;
+let importedEvents = new Map();
+let importedFiles = new Map();
+let importGeneration = 0;
+let importQueue = Promise.resolve();
+const dateAt = (day) => new Date(displayedMonday.getTime() + day * 86400000);
+const shortDate = (date) => `${date.getUTCMonth() + 1}/${date.getUTCDate()}`;
 const timeAt = (slot) => `${String(9 + Math.floor(slot / 2)).padStart(2, "0")}:${slot % 2 ? "30" : "00"}`;
 const weekdays = ["月", "火", "水", "木", "金"];
 const demoMonday = startOfWeek(today);
@@ -22,9 +17,8 @@ const demoReservations = [
   { day: 0, slot: 0, name: "田中 花子", email: "hanako@example.com" },
   { day: 2, slot: 5, name: "山田 太郎", email: "taro@example.com" }
 ].map((reservation) => {
-  const date = new Date(demoMonday);
-  date.setDate(date.getDate() + reservation.day);
-  return { ...reservation, date };
+  const date = new Date(demoMonday.getTime() + reservation.day * 86400000);
+  return { ...reservation, date, ...Calendar.slotRange(date, reservation.slot) };
 });
 
 function createTextElement(tag, text, className) {
@@ -36,14 +30,14 @@ function createTextElement(tag, text, className) {
 
 function openReservationDialog(date, slot) {
   byId("reservation-dialog").querySelector("form").reset();
-  byId("selected-slot").textContent = `${date.getFullYear()}年${date.getMonth() + 1}月${date.getDate()}日（${weekdays[(date.getDay() + 6) % 7]}） ${timeAt(slot)}–${timeAt(slot + 1)}`;
+  byId("selected-slot").textContent = `${date.getUTCFullYear()}年${date.getUTCMonth() + 1}月${date.getUTCDate()}日（${weekdays[(date.getUTCDay() + 6) % 7]}） ${timeAt(slot)}–${timeAt(slot + 1)}`;
   byId("reservation-dialog").showModal();
 }
 
 function renderCalendar() {
   const monday = dateAt(0);
   const friday = dateAt(4);
-  byId("week-label").textContent = `${shortDate(monday)} ～ ${shortDate(friday)} (${monday.getFullYear()}${monday.getFullYear() !== friday.getFullYear() ? `–${friday.getFullYear()}` : ""})`;
+  byId("week-label").textContent = `${shortDate(monday)} ～ ${shortDate(friday)} (${monday.getUTCFullYear()}${monday.getUTCFullYear() !== friday.getUTCFullYear() ? `–${friday.getUTCFullYear()}` : ""})`;
   const heading = document.createElement("tr");
   const corner = createTextElement("th", "時刻");
   corner.scope = "col";
@@ -63,15 +57,18 @@ function renderCalendar() {
     row.append(label);
     weekdays.forEach((weekday, day) => {
       const date = dateAt(day);
-      const reservation = demoReservations.find((item) => item.date.getTime() === date.getTime() && item.slot === slot);
+      const result = Calendar.availability(date, slot, [...importedEvents.values()], demoReservations);
+      const reservation = result.reservation;
       const cell = document.createElement("td");
       if (reservation) {
         cell.className = "reserved";
-        cell.textContent = reservation.name;
+        cell.textContent = `${reservation.name}（デモ）`;
         cell.setAttribute("aria-label", `${shortDate(date)} ${timeAt(slot)} 予約済み ${reservation.name}（仮データ）`);
-      } else if ((day === 3 && slot < 8) || (day === 1 && slot >= 3 && slot <= 5) || (day === 4 && slot >= 14)) {
+      } else if (result.state === "busy") {
         cell.className = "busy";
         cell.textContent = "予定あり";
+        cell.title = result.busy.map((event) => event.summary).join("、");
+        cell.setAttribute("aria-label", `${shortDate(date)} ${timeAt(slot)} ICS予定あり ${cell.title}`);
       } else {
         const button = createTextElement("button", "");
         button.type = "button";
@@ -93,12 +90,12 @@ function renderReservations() {
     const top = createTextElement("div", "", "card-top");
     const detail = document.createElement("div");
     detail.append(createTextElement("strong", `${shortDate(reservation.date)}（${weekdays[reservation.day]}） ${timeAt(reservation.slot)}–${timeAt(reservation.slot + 1)}`), createTextElement("p", `${reservation.name} 様`, "name"), createTextElement("p", reservation.email, "email"));
-    top.append(createTextElement("span", "確定", "stamp"), detail);
+    top.append(createTextElement("span", "デモ", "stamp"), detail);
     const actions = createTextElement("div", "", "card-actions");
     const cancel = createTextElement("button", "キャンセル", "button");
     cancel.type = "button";
     cancel.disabled = true;
-    cancel.title = "STEP 2以降に実装予定";
+    cancel.title = "STEP 3以降に実装予定";
     actions.append(cancel);
     card.append(top, actions);
     cards.append(card);
@@ -107,30 +104,59 @@ function renderReservations() {
   byId("reservation-count").textContent = `${demoReservations.length}件`;
 }
 
+function importSummary() {
+  return importedFiles.size
+    ? `読み込み済み：${[...importedFiles].map(([name, count]) => `${name}（${count}件）`).join("、")} · UID重複除去後 ${importedEvents.size}件（キャンセル ${[...importedEvents.values()].filter((e) => e.status === "CANCELLED").length}件）`
+    : "未読み込み · ICS予定は未確認です。予約2件は学習用デモです。";
+}
 function showSelectedFiles(files) {
-  // 名前のみ表示し、ファイルの内容にはアクセスしません。
   const selected = Array.from(files);
-  const isCalendarFile = (file) => /\.ics$/i.test(file.name);
+  const generation = importGeneration;
   if (!selected.length) return;
-  if (!selected.every(isCalendarFile)) {
-    byId("import-status").textContent = ".ics ファイルを選択してください。予定はまだ読み込まれていません。";
-    return;
-  }
-  byId("import-status").textContent = `選択済み：${selected.map((file) => file.name).join("、")}（${selected.length}ファイル） · ICS解析は未実装です`;
+  importQueue = importQueue.then(async () => {
+    if (generation !== importGeneration) return;
+    const errors = [];
+    for (const file of selected) {
+      try {
+        if (!/\.ics$/i.test(file.name)) throw new Error(".ics ファイルを選択してください。");
+        const source = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = reader.onabort = () => reject(new Error("ファイルを読み込めませんでした。"));
+          reader.readAsText(file, "UTF-8");
+        });
+        const events = ICSParser.parse(source);
+        if (generation !== importGeneration) return;
+        events.forEach((event) => importedEvents.set(event.uid, event));
+        importedFiles.set(file.name, events.length);
+      } catch (error) {
+        errors.push(`${file.name}：${error.message}`);
+      }
+    }
+    if (generation !== importGeneration) return;
+    byId("import-status").textContent = importSummary();
+    byId("import-error").textContent = errors.length ? `読み込みエラー（失敗したファイルは取り込んでいません）：${errors.join(" / ")}` : "";
+    renderCalendar();
+  });
 }
 
 document.querySelector(".close-button").addEventListener("click", () => {
   byId("reservation-dialog").close();
 });
-byId("today").textContent = today.toLocaleDateString("ja-JP", { year: "numeric", month: "long", day: "numeric", weekday: "short" });
-byId("previous-week").addEventListener("click", () => { displayedMonday.setDate(displayedMonday.getDate() - 7); renderCalendar(); });
-byId("next-week").addEventListener("click", () => { displayedMonday.setDate(displayedMonday.getDate() + 7); renderCalendar(); });
-byId("current-week").addEventListener("click", () => { displayedMonday = startOfWeek(new Date()); renderCalendar(); });
+byId("today").textContent = today.toLocaleDateString("ja-JP", { timeZone: "UTC", year: "numeric", month: "long", day: "numeric", weekday: "short" });
+byId("previous-week").addEventListener("click", () => { displayedMonday.setUTCDate(displayedMonday.getUTCDate() - 7); renderCalendar(); });
+byId("next-week").addEventListener("click", () => { displayedMonday.setUTCDate(displayedMonday.getUTCDate() + 7); renderCalendar(); });
+byId("current-week").addEventListener("click", () => { displayedMonday = startOfWeek(Calendar.today()); renderCalendar(); });
 byId("choose-file").addEventListener("click", () => byId("ics-file").click());
-byId("ics-file").addEventListener("change", (event) => showSelectedFiles(event.target.files));
+byId("ics-file").addEventListener("change", (event) => { showSelectedFiles(event.target.files); event.target.value = ""; });
 byId("clear-files").addEventListener("click", () => {
+  importGeneration += 1;
+  importedEvents.clear();
+  importedFiles.clear();
   byId("ics-file").value = "";
-  byId("import-status").textContent = "未読み込み · ファイル選択をクリアしました。仮データは引き続き表示しています。";
+  byId("import-status").textContent = importSummary();
+  byId("import-error").textContent = "";
+  renderCalendar();
 });
 const dropZone = byId("drop-zone");
 ["dragenter", "dragover"].forEach((eventName) => dropZone.addEventListener(eventName, (event) => { event.preventDefault(); dropZone.classList.add("drag-over"); }));
