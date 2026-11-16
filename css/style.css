@@ -499,6 +499,10 @@ dialog::backdrop {
   font-weight: 600;
 }
 
+#cancel-detail {
+  overflow-wrap: anywhere;
+}
+
 dialog label {
   display: block;
   font-size: 12px;

@@ -700,6 +700,48 @@ with sync_playwright() as p:
                 another.close()
     run_booking_test('STEP3 時計初期化10回反復', repeated_clock)
 
+    def cancel_dialog_overflow(target, _):
+        name = 'A' * 100
+        email = 'a' * 242 + '@example.com'  # 最大254文字の正常な形式
+        load_ics(target)
+        open_booking(target)
+        target.locator('#customer-name').fill(name)
+        target.locator('#customer-email').fill(email)
+        target.locator('#confirm-booking').click()
+        assert not target.locator('#reservation-dialog').evaluate('(e) => e.open')
+        for width in [390, 1440]:
+            target.set_viewport_size({'width': width, 'height': 900})
+            target.locator('#reservation-list button').click()
+            dialog = target.locator('#cancel-dialog')
+            assert dialog.evaluate('(e) => e.open')
+            detail = target.locator('#cancel-detail')
+            assert name in detail.inner_text() and email in detail.inner_text()
+            assert detail.evaluate('''element => {
+                const dialog = element.closest('dialog');
+                const style = getComputedStyle(element);
+                const range = document.createRange();
+                range.selectNodeContents(element);
+                const bounds = element.getBoundingClientRect();
+                return style.overflowWrap === 'anywhere' && style.textOverflow !== 'ellipsis' &&
+                    element.scrollWidth <= element.clientWidth && dialog.scrollWidth <= dialog.clientWidth &&
+                    Array.from(range.getClientRects()).every(rect => rect.left >= bounds.left && rect.right <= bounds.right + 1);
+            }'''), width
+            assert target.evaluate('document.documentElement.scrollWidth <= innerWidth'), width
+            # 確認画面を閉じても予約と保存内容は変わらない。
+            before = read_bookings(target)
+            target.locator('#dismiss-cancel').click()
+            assert not dialog.evaluate('(e) => e.open')
+            assert read_bookings(target) == before
+            assert before[0]['status'] == 'confirmed'
+        target.locator('#reservation-list button').click()
+        target.locator('#confirm-cancel').click()
+        assert not target.locator('#cancel-dialog').evaluate('(e) => e.open')
+        saved = read_bookings(target)[0]
+        assert saved['status'] == 'cancelled' and saved['cancelledAt'] is not None
+        assert saved['name'] == name and saved['email'] == email
+        assert slot(target).locator('button').count() == 1
+    run_booking_test('STEP3 キャンセル確認の長い氏名・254文字メール・390px/1440px・中止と確定', cancel_dialog_overflow)
+
     print(json.dumps({'sample_events': len(events), 'browser_errors': errors, 'passed': len(passed), 'failed': len(failures), 'test_groups': passed, 'failures': failures}, ensure_ascii=False))
     assert not failures, failures
 
