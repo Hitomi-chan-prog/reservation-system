@@ -5,6 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>予約受付台帳 | Reservation Ledger</title>
     <link rel="stylesheet" href="css/style.css">
+    <script src="js/ics-parser.js" defer></script>
+    <script src="js/calendar.js" defer></script>
     <script src="js/app.js" defer></script>
   </head>
   <body>
@@ -30,15 +32,16 @@
             <span class="file-icon" aria-hidden="true">.ics</span>
             <div class="drop-copy">
               <strong>ここにファイルをドラッグ＆ドロップ</strong>
-              <span>STEP 1ではファイル名の表示のみ行います</span>
+              <span>複数ファイル対応 · 日時は日本時間（Asia/Tokyo）で判定</span>
             </div>
             <button id="choose-file" class="button primary" type="button">ファイルを選択</button>
             <input id="ics-file" type="file" accept=".ics,text/calendar" multiple hidden>
           </div>
           <div class="import-footer">
-            <p id="import-status" role="status">未読み込み · カレンダーには仮データを表示しています</p>
-            <button id="clear-files" class="button" type="button">選択したファイルをクリア</button>
+            <p id="import-status" role="status">未読み込み · ICS予定は未確認です。予約2件は学習用デモです。</p>
+            <button id="clear-files" class="button" type="button">読み込んだ予定をクリア</button>
           </div>
+          <p id="import-error" class="description" role="alert"></p>
         </section>
         <section class="schedule-section" aria-labelledby="calendar-heading">
           <div class="section-top">
@@ -49,7 +52,7 @@
               </h2>
               <p class="description">緑の空き枠をクリックすると、予約入力画面が開きます。</p>
             </div>
-            <span class="demo-label">STEP 1 / UI DEMO</span>
+            <span class="demo-label">STEP 2 / ICS</span>
           </div>
           <div class="calendar-toolbar">
             <nav class="week-navigation" aria-label="表示する週">
@@ -80,7 +83,7 @@
                 <thead id="calendar-head"></thead>
                 <tbody id="calendar-body"></tbody>
               </table>
-              <p class="calendar-note">受付時間 9:00–18:00 / 1枠30分 · 表示中の予定・予約はすべて仮データです。</p>
+              <p class="calendar-note">受付時間 9:00–18:00（日本時間）/ 1枠30分 · 予定はICS、予約2件は学習用デモです。未読み込み時の緑枠は予定未確認です。</p>
             </div>
             <aside class="reservations" aria-labelledby="reservations-heading">
               <h2 id="reservations-heading">
@@ -89,9 +92,9 @@
                 <span id="reservation-count" class="count"></span>
               </h2>
               <p class="description">
-                仮データの予約を表示しています。
+                STEP 1の学習用デモ予約2件です。
                 <br>
-                キャンセル処理はSTEP 2以降に実装します。
+                キャンセル処理はSTEP 3以降に実装します。
               </p>
               <div id="reservation-list"></div>
               <p class="aside-note">
@@ -110,7 +113,7 @@
             管理者画面
           </h2>
           <p class="admin-warning">アクセス制限のないデモ画面です。管理者認証は実装されていません。</p>
-          <p>予約の検索・一覧管理・予定の管理を、STEP 2以降に実装するための画面です。</p>
+          <p>予約の検索・一覧管理・予定の管理を、STEP 3以降に実装するための画面です。</p>
           <div class="admin-placeholder">
             <h3>予約管理</h3>
             <p>認証・予約管理処理は未実装です。</p>
@@ -136,7 +139,7 @@
         <input id="customer-name" name="name" autocomplete="name" placeholder="例：山田 太郎">
         <label for="customer-email">メールアドレス</label>
         <input id="customer-email" name="email" type="email" autocomplete="email" placeholder="例：taro@example.com">
-        <p class="dialog-note">予約確定機能はSTEP 2以降に実装予定です。</p>
+        <p class="dialog-note">予約確定機能はSTEP 3以降に実装予定です。</p>
         <div class="dialog-actions">
           <button class="button" value="cancel" formnovalidate>キャンセル</button>
           <button class="button primary" type="button" disabled>予約を確定する</button>
