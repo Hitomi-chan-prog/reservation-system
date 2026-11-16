@@ -18,7 +18,7 @@ window.Calendar = (() => {
   function availability(date, slot, events, reservations) {
     const range = slotRange(date, slot);
     const busy = events.filter((event) => event.status !== 'CANCELLED' && overlaps(event, range));
-    const reserved = reservations.find((event) => overlaps(event, range));
+    const reserved = reservations.find((event) => event.status === 'confirmed' && overlaps(event, range));
     return { state: reserved ? 'reserved' : busy.length ? 'busy' : 'available', busy, reservation: reserved };
   }
   return { today, startOfWeek, slotRange, overlaps, availability };

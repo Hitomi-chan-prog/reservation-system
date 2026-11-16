@@ -7,6 +7,8 @@
     <link rel="stylesheet" href="css/style.css">
     <script src="js/ics-parser.js" defer></script>
     <script src="js/calendar.js" defer></script>
+    <script src="js/reservations.js" defer></script>
+    <script src="js/storage.js" defer></script>
     <script src="js/app.js" defer></script>
   </head>
   <body>
@@ -38,10 +40,13 @@
             <input id="ics-file" type="file" accept=".ics,text/calendar" multiple hidden>
           </div>
           <div class="import-footer">
-            <p id="import-status" role="status">未読み込み · ICS予定は未確認です。予約2件は学習用デモです。</p>
+            <p id="import-status" role="status">未読み込み · ICSを読み込むまで新規予約は確定できません。</p>
             <button id="clear-files" class="button" type="button">読み込んだ予定をクリア</button>
           </div>
           <p id="import-error" class="description" role="alert"></p>
+          <p id="storage-error" class="error-message" role="alert"></p>
+          <p id="operation-status" class="description" role="status"></p>
+          <p id="conflict-warning" class="conflict-warning" role="alert"></p>
         </section>
         <section class="schedule-section" aria-labelledby="calendar-heading">
           <div class="section-top">
@@ -52,7 +57,7 @@
               </h2>
               <p class="description">緑の空き枠をクリックすると、予約入力画面が開きます。</p>
             </div>
-            <span class="demo-label">STEP 2 / ICS</span>
+            <span class="demo-label">STEP 3 / LOCAL</span>
           </div>
           <div class="calendar-toolbar">
             <nav class="week-navigation" aria-label="表示する週">
@@ -83,7 +88,7 @@
                 <thead id="calendar-head"></thead>
                 <tbody id="calendar-body"></tbody>
               </table>
-              <p class="calendar-note">受付時間 9:00–18:00（日本時間）/ 1枠30分 · 予定はICS、予約2件は学習用デモです。未読み込み時の緑枠は予定未確認です。</p>
+              <p class="calendar-note">受付時間 9:00–18:00（日本時間）/ 1枠30分 · 予定はICS、予約はこのブラウザの保存データです。未読み込み時の緑枠は予定未確認です。</p>
             </div>
             <aside class="reservations" aria-labelledby="reservations-heading">
               <h2 id="reservations-heading">
@@ -92,15 +97,11 @@
                 <span id="reservation-count" class="count"></span>
               </h2>
               <p class="description">
-                STEP 1の学習用デモ予約2件です。
-                <br>
-                キャンセル処理はSTEP 3以降に実装します。
+                このブラウザに保存された予約です。本人認証はありません。
               </p>
               <div id="reservation-list"></div>
               <p class="aside-note">
-                このデモでは、入力内容の保存や
-                <br>
-                メールの送信は行いません。
+                氏名・メールアドレスはこのブラウザのlocalStorageに残ります。共有PCではご注意ください。メールは送信しません。複数PC・利用者間では共有されず、複数タブの完全な同時予約防止は保証できません。
               </p>
             </aside>
           </div>
@@ -113,38 +114,47 @@
             管理者画面
           </h2>
           <p class="admin-warning">アクセス制限のないデモ画面です。管理者認証は実装されていません。</p>
-          <p>予約の検索・一覧管理・予定の管理を、STEP 3以降に実装するための画面です。</p>
-          <div class="admin-placeholder">
-            <h3>予約管理</h3>
-            <p>認証・予約管理処理は未実装です。</p>
-            <button class="button" disabled>予約データの管理（準備中）</button>
-          </div>
+          <p>ローカルデモ・認証なし。このブラウザに保存された全予約を日時順に表示します。</p>
+          <p id="admin-storage-error" class="error-message" role="alert"></p>
+          <p id="admin-reservation-count" class="description"></p>
+          <div id="admin-reservation-list"></div>
           <a class="button" href="#booking">← 予約受付画面へ戻る</a>
         </section>
       </main>
       <footer class="footer">
         <span>RESERVATION LEDGER</span>
-        <span>ローカルデモ · データは保存されません</span>
+        <span>ローカルデモ · 予約はこのブラウザに保存されます</span>
       </footer>
     </div>
     <dialog id="reservation-dialog" aria-labelledby="dialog-heading">
-      <form method="dialog">
+      <form id="booking-form" novalidate>
         <div class="dialog-heading">
           <h2 id="dialog-heading">予約内容の確認</h2>
           <button class="close-button" type="button" aria-label="閉じる">×</button>
         </div>
         <p id="selected-slot" class="selected-slot"></p>
-        <p class="description">入力画面のデモです。予約は確定されません。</p>
+        <p class="description">氏名・メールアドレスがこのブラウザに保存されます。本人認証・メール送信はありません。</p>
         <label for="customer-name">氏名</label>
-        <input id="customer-name" name="name" autocomplete="name" placeholder="例：山田 太郎">
+        <input id="customer-name" name="name" required autocomplete="name" placeholder="例：山田 太郎">
         <label for="customer-email">メールアドレス</label>
-        <input id="customer-email" name="email" type="email" autocomplete="email" placeholder="例：taro@example.com">
-        <p class="dialog-note">予約確定機能はSTEP 3以降に実装予定です。</p>
+        <input id="customer-email" name="email" type="email" required autocomplete="email" placeholder="例：taro@example.com">
+        <p id="booking-hint" class="dialog-note"></p>
+        <p id="booking-error" class="error-message" role="alert"></p>
         <div class="dialog-actions">
-          <button class="button" value="cancel" formnovalidate>キャンセル</button>
-          <button class="button primary" type="button" disabled>予約を確定する</button>
+          <button class="button" id="dismiss-booking" type="button">閉じる</button>
+          <button id="confirm-booking" class="button primary" type="submit" disabled>予約を確定する</button>
         </div>
       </form>
+    </dialog>
+    <dialog id="cancel-dialog" aria-labelledby="cancel-heading">
+      <h2 id="cancel-heading">予約キャンセルの確認</h2>
+      <p id="cancel-detail" class="selected-slot"></p>
+      <p class="description">このブラウザに保存された予約をキャンセルします。本人認証はありません。</p>
+      <p id="cancel-error" class="error-message" role="alert"></p>
+      <div class="dialog-actions">
+        <button id="dismiss-cancel" class="button" type="button">戻る</button>
+        <button id="confirm-cancel" class="button primary" type="button">キャンセルを確定する</button>
+      </div>
     </dialog>
   </body>
 </html>

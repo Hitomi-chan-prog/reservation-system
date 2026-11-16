@@ -12,14 +12,14 @@ const dateAt = (day) => new Date(displayedMonday.getTime() + day * 86400000);
 const shortDate = (date) => `${date.getUTCMonth() + 1}/${date.getUTCDate()}`;
 const timeAt = (slot) => `${String(9 + Math.floor(slot / 2)).padStart(2, "0")}:${slot % 2 ? "30" : "00"}`;
 const weekdays = ["月", "火", "水", "木", "金"];
-const demoMonday = startOfWeek(today);
-const demoReservations = [
-  { day: 0, slot: 0, name: "田中 花子", email: "hanako@example.com" },
-  { day: 2, slot: 5, name: "山田 太郎", email: "taro@example.com" }
-].map((reservation) => {
-  const date = new Date(demoMonday.getTime() + reservation.day * 86400000);
-  return { ...reservation, date, ...Calendar.slotRange(date, reservation.slot) };
-});
+let reservations = [];
+let selectedRange = null;
+let cancelId = null;
+let pendingImports = 0;
+const tokyoDate = (timestamp) => new Intl.DateTimeFormat('ja-JP', { timeZone: 'Asia/Tokyo', year: 'numeric', month: '2-digit', day: '2-digit', weekday: 'short' }).format(timestamp);
+const tokyoTime = (timestamp) => new Intl.DateTimeFormat('ja-JP', { timeZone: 'Asia/Tokyo', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(timestamp);
+const bookingLabel = (item) => `${tokyoDate(item.start)} ${tokyoTime(item.start)}–${tokyoTime(item.end)}`;
+const icsReady = () => importedFiles.size > 0 && pendingImports === 0;
 
 function createTextElement(tag, text, className) {
   const element = document.createElement(tag);
@@ -29,12 +29,16 @@ function createTextElement(tag, text, className) {
 }
 
 function openReservationDialog(date, slot) {
+  selectedRange = Calendar.slotRange(date, slot);
   byId("reservation-dialog").querySelector("form").reset();
+  byId("booking-error").textContent = "";
+  updateBookingHint();
   byId("selected-slot").textContent = `${date.getUTCFullYear()}年${date.getUTCMonth() + 1}月${date.getUTCDate()}日（${weekdays[(date.getUTCDay() + 6) % 7]}） ${timeAt(slot)}–${timeAt(slot + 1)}`;
   byId("reservation-dialog").showModal();
 }
 
 function renderCalendar() {
+  byId("today").textContent = Calendar.today().toLocaleDateString("ja-JP", { timeZone: "UTC", year: "numeric", month: "long", day: "numeric", weekday: "short" });
   const monday = dateAt(0);
   const friday = dateAt(4);
   byId("week-label").textContent = `${shortDate(monday)} ～ ${shortDate(friday)} (${monday.getUTCFullYear()}${monday.getUTCFullYear() !== friday.getUTCFullYear() ? `–${friday.getUTCFullYear()}` : ""})`;
@@ -57,13 +61,14 @@ function renderCalendar() {
     row.append(label);
     weekdays.forEach((weekday, day) => {
       const date = dateAt(day);
-      const result = Calendar.availability(date, slot, [...importedEvents.values()], demoReservations);
+      const result = Calendar.availability(date, slot, [...importedEvents.values()], reservations);
       const reservation = result.reservation;
       const cell = document.createElement("td");
       if (reservation) {
         cell.className = "reserved";
-        cell.textContent = `${reservation.name}（デモ）`;
-        cell.setAttribute("aria-label", `${shortDate(date)} ${timeAt(slot)} 予約済み ${reservation.name}（仮データ）`);
+        cell.textContent = reservation.name;
+        cell.title = reservation.name;
+        cell.setAttribute("aria-label", `${shortDate(date)} ${timeAt(slot)} 予約済み ${reservation.name}`);
       } else if (result.state === "busy") {
         cell.className = "busy";
         cell.textContent = "予定あり";
@@ -84,35 +89,78 @@ function renderCalendar() {
 }
 
 function renderReservations() {
-  const cards = document.createDocumentFragment();
-  demoReservations.forEach((reservation) => {
-    const card = createTextElement("article", "", "reservation-card");
-    const top = createTextElement("div", "", "card-top");
-    const detail = document.createElement("div");
-    detail.append(createTextElement("strong", `${shortDate(reservation.date)}（${weekdays[reservation.day]}） ${timeAt(reservation.slot)}–${timeAt(reservation.slot + 1)}`), createTextElement("p", `${reservation.name} 様`, "name"), createTextElement("p", reservation.email, "email"));
-    top.append(createTextElement("span", "デモ", "stamp"), detail);
-    const actions = createTextElement("div", "", "card-actions");
-    const cancel = createTextElement("button", "キャンセル", "button");
-    cancel.type = "button";
-    cancel.disabled = true;
-    cancel.title = "STEP 3以降に実装予定";
-    actions.append(cancel);
-    card.append(top, actions);
-    cards.append(card);
-  });
-  byId("reservation-list").replaceChildren(cards);
-  byId("reservation-count").textContent = `${demoReservations.length}件`;
+  const sorted = [...reservations].sort((a, b) => a.start - b.start || a.createdAt - b.createdAt);
+  for (const [containerId, withActions] of [['reservation-list', true], ['admin-reservation-list', false]]) {
+    const cards = document.createDocumentFragment();
+    sorted.forEach((reservation) => {
+      const card = createTextElement("article", "", "reservation-card");
+      const top = createTextElement("div", "", "card-top");
+      const detail = createTextElement("div", "", "reservation-detail");
+      detail.append(createTextElement("strong", bookingLabel(reservation)), createTextElement("p", `${reservation.name} 様`, "name"), createTextElement("p", reservation.email, "email"));
+      top.append(createTextElement("span", reservation.status === 'confirmed' ? "確定" : "取消", "stamp"), detail);
+      card.append(top, createTextElement('p', reservation.status === 'confirmed' ? '確定' : 'キャンセル済み', 'description'));
+      if (reservation.status === 'confirmed' && [...importedEvents.values()].some((event) => event.status !== 'CANCELLED' && Calendar.overlaps(event, reservation))) {
+        card.append(createTextElement('p', 'ICS予定と競合しています。予約は保持されています。', 'conflict-warning'));
+      }
+      if (withActions) {
+        const actions = createTextElement("div", "", "card-actions");
+        const cancel = createTextElement("button", "キャンセル", "button");
+        cancel.type = "button";
+        cancel.disabled = reservation.status !== 'confirmed';
+        cancel.addEventListener('click', () => {
+          cancelId = reservation.id;
+          byId('cancel-detail').textContent = `${bookingLabel(reservation)} / ${reservation.name} / ${reservation.email}`;
+          byId('cancel-error').textContent = '';
+          byId('cancel-dialog').showModal();
+        });
+        actions.append(cancel);
+        card.append(actions);
+      }
+      cards.append(card);
+    });
+    if (!sorted.length) cards.append(createTextElement('p', '予約はまだありません', 'description'));
+    byId(containerId).replaceChildren(cards);
+  }
+  const count = `${sorted.length}件（確定 ${sorted.filter((item) => item.status === 'confirmed').length}件）`;
+  byId("reservation-count").textContent = count;
+  byId('admin-reservation-count').textContent = count;
+}
+function updateBookingHint() {
+  byId('confirm-booking').disabled = !icsReady();
+  byId('booking-hint').textContent = icsReady() ? '選択日時と入力内容を確認して予約を確定してください。' : 'ICSファイルを読み込み、完了するまで予約を確定できません。';
+}
+function renderAll() {
+  renderCalendar();
+  renderReservations();
+  updateBookingHint();
+  const conflicts = reservations.filter((item) => item.status === 'confirmed' && [...importedEvents.values()].some((event) => event.status !== 'CANCELLED' && Calendar.overlaps(event, item)));
+  byId('conflict-warning').textContent = conflicts.length ? `ICS予定と競合する予約が${conflicts.length}件あります：${conflicts.map(bookingLabel).join('、')}。予約は自動削除していません。` : '';
+}
+function showStorageError(message) {
+  byId('storage-error').textContent = message;
+  byId('admin-storage-error').textContent = message;
+}
+function reloadReservations() {
+  try {
+    reservations = BookingStorage.read();
+    showStorageError('');
+  } catch (error) {
+    showStorageError(error.message);
+  }
+  renderAll();
 }
 
 function importSummary() {
   return importedFiles.size
     ? `読み込み済み：${[...importedFiles].map(([name, count]) => `${name}（${count}件）`).join("、")} · UID重複除去後 ${importedEvents.size}件（キャンセル ${[...importedEvents.values()].filter((e) => e.status === "CANCELLED").length}件）`
-    : "未読み込み · ICS予定は未確認です。予約2件は学習用デモです。";
+    : "未読み込み · ICSを読み込むまで新規予約は確定できません。";
 }
 function showSelectedFiles(files) {
   const selected = Array.from(files);
   const generation = importGeneration;
   if (!selected.length) return;
+  pendingImports += 1;
+  updateBookingHint();
   importQueue = importQueue.then(async () => {
     if (generation !== importGeneration) return;
     const errors = [];
@@ -136,14 +184,16 @@ function showSelectedFiles(files) {
     if (generation !== importGeneration) return;
     byId("import-status").textContent = importSummary();
     byId("import-error").textContent = errors.length ? `読み込みエラー（失敗したファイルは取り込んでいません）：${errors.join(" / ")}` : "";
-    renderCalendar();
+    renderAll();
+  }).finally(() => {
+    pendingImports -= 1;
+    updateBookingHint();
   });
 }
 
 document.querySelector(".close-button").addEventListener("click", () => {
   byId("reservation-dialog").close();
 });
-byId("today").textContent = today.toLocaleDateString("ja-JP", { timeZone: "UTC", year: "numeric", month: "long", day: "numeric", weekday: "short" });
 byId("previous-week").addEventListener("click", () => { displayedMonday.setUTCDate(displayedMonday.getUTCDate() - 7); renderCalendar(); });
 byId("next-week").addEventListener("click", () => { displayedMonday.setUTCDate(displayedMonday.getUTCDate() + 7); renderCalendar(); });
 byId("current-week").addEventListener("click", () => { displayedMonday = startOfWeek(Calendar.today()); renderCalendar(); });
@@ -156,7 +206,7 @@ byId("clear-files").addEventListener("click", () => {
   byId("ics-file").value = "";
   byId("import-status").textContent = importSummary();
   byId("import-error").textContent = "";
-  renderCalendar();
+  renderAll();
 });
 const dropZone = byId("drop-zone");
 ["dragenter", "dragover"].forEach((eventName) => dropZone.addEventListener(eventName, (event) => { event.preventDefault(); dropZone.classList.add("drag-over"); }));
@@ -171,6 +221,44 @@ function renderRoute() {
   byId("admin-view").hidden = !isAdmin;
 }
 window.addEventListener("hashchange", renderRoute);
-renderCalendar();
-renderReservations();
+byId('booking-form').addEventListener('submit', (event) => {
+  event.preventDefault();
+  byId('operation-status').textContent = '';
+  try {
+    if (!selectedRange) throw new Error('予約枠を選択してください。');
+    reservations = Reservations.register({
+      ...selectedRange, name: byId('customer-name').value, email: byId('customer-email').value,
+      icsReady: icsReady(), events: [...importedEvents.values()]
+    });
+    byId('reservation-dialog').close();
+    showStorageError('');
+    byId('operation-status').textContent = '予約を登録しました。このブラウザに保存されています。';
+    renderAll();
+  } catch (error) {
+    byId('booking-error').textContent = error.message;
+    reloadReservations();
+  }
+});
+byId('confirm-cancel').addEventListener('click', () => {
+  byId('operation-status').textContent = '';
+  try {
+    reservations = Reservations.cancel(cancelId);
+    byId('cancel-dialog').close();
+    showStorageError('');
+    byId('operation-status').textContent = '予約をキャンセルし、保存しました。';
+    renderAll();
+  } catch (error) {
+    byId('cancel-error').textContent = error.message;
+    reloadReservations();
+  }
+});
+byId('dismiss-booking').addEventListener('click', () => byId('reservation-dialog').close());
+byId('dismiss-cancel').addEventListener('click', () => byId('cancel-dialog').close());
+window.addEventListener('storage', (event) => {
+  if (event.key === BookingStorage.key || event.key === null) {
+    byId('operation-status').textContent = '';
+    reloadReservations();
+  }
+});
+reloadReservations();
 renderRoute();
