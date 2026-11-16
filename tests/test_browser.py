@@ -152,6 +152,17 @@ with sync_playwright() as p:
     assert floating['start'] == tokyo['start'] == explicit_type['start']
     passed.append('空パラメーター拒否・正常日時維持')
 
+    # 片側の引用符を拒否し、正常な引用・非引用形式は同じ日時に変換する。
+    for field in ['DTSTART', 'DTEND']:
+        for parameter in ['TZID=Asia/Tokyo"', 'TZID="Asia/Tokyo', 'VALUE=DATE-TIME"']:
+            source = event('quote').replace(field + ':', field + ';' + parameter + ':')
+            reject_ics(source, 'ICS構文')
+        for parameter in ['TZID="Asia/Tokyo"', 'TZID=Asia/Tokyo', 'VALUE="DATE-TIME"']:
+            parsed = parse_ics(event('quote').replace(field + ':', field + ';' + parameter + ':'))[0]
+            assert parsed['start'] == floating['start']
+            assert parsed['end'] == floating['end']
+    passed.append('パラメーター引用符の許可・拒否')
+
     page.locator('#clear-files').click()
     load('update.ics', event('same', start='20260701T100000', end='20260701T103000'))
     original_start = page.evaluate('importedEvents.get("same").start')

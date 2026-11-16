@@ -18,13 +18,15 @@ window.ICSParser = (() => {
     return result;
   }
   function property(line) {
-    const match = /^([A-Za-z0-9-]+)((?:;[A-Za-z0-9-]+=(?:"[^"]*"|[^:;\r\n]+))*):(.*)$/.exec(line);
+    const match = /^([A-Za-z0-9-]+)((?:;[A-Za-z0-9-]+=(?:"[^"]*"|[^":;\r\n]+))*):(.*)$/.exec(line);
     if (!match) fail('不正または未対応のICS構文です。');
     const params = {};
-    for (const item of match[2].matchAll(/;([A-Za-z0-9-]+)=("[^"]*"|[^;]+)/g)) {
+    for (const item of match[2].matchAll(/;([A-Za-z0-9-]+)=("[^"]*"|[^":;\r\n]+)/g)) {
       const key = item[1].toUpperCase();
       if (key in params) fail('パラメーターが重複しています。');
-      params[key] = item[2].replace(/^"|"$/g, '');
+      const rawValue = item[2];
+      params[key] = rawValue.startsWith('"') && rawValue.endsWith('"')
+        ? rawValue.slice(1, -1) : rawValue;
     }
     return { name: match[1].toUpperCase(), params, value: match[3] };
   }
