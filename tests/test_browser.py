@@ -285,7 +285,8 @@ with sync_playwright() as p:
             assert not page_errors, page_errors
             passed.append(label)
         except Exception as error:
-            failures.append({'test': label, 'error': str(error)})
+            import traceback
+            failures.append({'test': label, 'error': traceback.format_exc()})
         finally:
             errors.extend(page_errors)
             isolated.close()
@@ -414,11 +415,14 @@ with sync_playwright() as p:
         saved = read_bookings(target)[0]
         assert saved['status'] == 'cancelled' and saved['cancelledAt'] is not None
         assert slot(target).locator('button').count() == 1
-        assert target.locator('#reservation-list button').is_disabled()
+        assert target.locator('#reservation-list button').count() == 0
+        target.locator('#cancelled-tab').click()
+        assert target.locator('#reservation-list button').count() == 0
         result = target.evaluate('''() => { try { Reservations.cancel(reservations[0].id); return ''; } catch(e) { return e.message; } }''')
         assert 'キャンセル済み' in result
         target.reload()
         assert read_bookings(target)[0]['status'] == 'cancelled'
+        target.locator('#cancelled-tab').click()
         assert 'キャンセル済み' in target.locator('#reservation-list').inner_text()
     run_booking_test('STEP3 キャンセル確認・解除・再取消拒否・再読込保持', cancel_booking)
 
@@ -501,7 +505,7 @@ with sync_playwright() as p:
         open_booking(target, 2)
         target.locator('#confirm-booking').click()
         target.locator('a[href="#admin"]').click()
-        assert target.locator('#admin-view').is_visible()
+        target.locator('#admin-view').wait_for(state='visible')
         assert '2件' in target.locator('#admin-reservation-count').inner_text()
         labels = target.locator('#admin-reservation-list strong').all_inner_texts()
         assert '10:00' in labels[0] and '11:00' in labels[1]
@@ -741,6 +745,265 @@ with sync_playwright() as p:
         assert saved['name'] == name and saved['email'] == email
         assert slot(target).locator('button').count() == 1
     run_booking_test('STEP3 キャンセル確認の長い氏名・254文字メール・390px/1440px・中止と確定', cancel_dialog_overflow)
+
+
+    # STEP 4: STEP 3形式のデータを画面から検索。保存文字列の不変性も検証する。
+    def seed(target, count=41):
+        return target.evaluate("""count => {
+          const items = [];
+          for (let day = 0; items.length < count; day++) {
+            const date = new Date(Date.UTC(2026, 5, 29 + day));
+            if ([0, 6].includes(date.getUTCDay())) continue;
+            for (let slot = 0; slot < 18 && items.length < count; slot++) {
+              const i = items.length;
+              items.push({id: `step3-${i}`, name: i === 0 ? '山田 花子' : `利用者${i}`,
+                email: i === 0 ? 'Hanako@Example.COM' : `user${i}@example.com`,
+                ...Calendar.slotRange(date, slot), status: 'confirmed', createdAt: 1, cancelledAt: null});
+            }
+          }
+          items.push({...Calendar.slotRange(new Date(Date.UTC(2026,5,29)), 0), createdAt: 1, email: 'history@example.com', ...items[0], id: 'history', name: '履歴の人', status: 'cancelled', cancelledAt: 1782691200000});
+          const raw = JSON.stringify({version: 1, reservations: items});
+          localStorage.setItem(BookingStorage.key, raw);
+          reloadReservations();
+          return raw;
+        }""", count)
+
+    def states(target, _):
+        seed(target)
+        assert target.locator('#confirmed-tab').inner_text() == '確定予約（41件）'
+        assert target.locator('#cancelled-tab').inner_text() == 'キャンセル履歴（1件）'
+        assert target.locator('#reservation-list .reservation-card').count() == 20
+        assert '履歴の人' not in target.locator('#reservation-list').inner_text()
+        target.locator('#cancelled-tab').click()
+        assert target.locator('#reservation-list .reservation-card').count() == 1
+        assert target.locator('#reservation-list button').count() == 0
+        assert '2026/06/29' in target.locator('#reservation-list').inner_text()
+        assert '09:00（日本時間）' in target.locator('#reservation-list').inner_text()
+        target.locator('#cancelled-tab').press('ArrowLeft')
+        assert target.locator('#confirmed-tab').get_attribute('aria-selected') == 'true'
+        assert target.locator('#confirmed-tab').evaluate('(e) => e === document.activeElement')
+    run_booking_test('STEP4 状態分離・タブ件数・履歴JST日時・参照専用・キーボード', states)
+
+    for query, expected in [('山田', 1), (' Hanako@Example.COM ', 1), ('HANAKO', 1), ('user1@', 1), ('存在しない', 0), ('   ', 41)]:
+        def search(target, _, query=query, expected=expected):
+            raw = seed(target)
+            target.locator('#booking-search').fill(query)
+            assert f'全{expected}件中' in target.locator('#booking-range').inner_text()
+            if expected == 0:
+                assert '一致する予約はありません' in target.locator('#reservation-list').inner_text()
+                assert target.locator('#booking-previous').is_disabled()
+                assert target.locator('#booking-next').is_disabled()
+            assert target.evaluate('localStorage.getItem(BookingStorage.key)') == raw
+        run_booking_test(f'STEP4 部分一致・空白・大文字小文字・ゼロ件検索 {query!r}', search)
+
+    def dates(target, _):
+        seed(target)
+        target.locator('#booking-date').fill('2026-06-30')
+        assert '全18件中' in target.locator('#booking-range').inner_text()
+        target.locator('#booking-search').fill('user2')
+        assert '全10件中' in target.locator('#booking-range').inner_text()
+        target.locator('#booking-clear-date').click()
+        assert target.locator('#booking-date').input_value() == ''
+        assert '全11件中' in target.locator('#booking-range').inner_text()
+        target.locator('#booking-search').fill('')
+        target.locator('#cancelled-tab').click()
+        target.locator('#booking-date').fill('2026-06-29')
+        assert '全1件中' in target.locator('#booking-range').inner_text()
+        target.locator('#booking-date').fill('2026-06-30')
+        assert '全0件中' in target.locator('#booking-range').inner_text()
+        # JST日付境界を米国TZのブラウザ内で検証
+        assert target.evaluate("ReservationList.dateKey(Date.parse('2026-06-28T15:00:00Z'))") == '2026-06-29'
+    run_booking_test('STEP4 予約日・複合検索・日付クリア・履歴の元予約日・JST境界', dates)
+
+    for count in [0, 20, 21, 40, 41]:
+        def pagination(target, _, count=count):
+            seed(target, count)
+            pages = max(1, (count + 19) // 20)
+            assert target.locator('#booking-page').inner_text() == f'1 / {pages}ページ'
+            assert target.locator('#booking-previous').is_disabled()
+            for number in range(1, pages + 1):
+                assert target.locator('#reservation-list .reservation-card').count() == min(20, count - (number - 1) * 20)
+                assert target.locator('#booking-page').inner_text() == f'{number} / {pages}ページ'
+                if number < pages:
+                    target.locator('#booking-next').click()
+            assert target.locator('#booking-next').is_disabled()
+            if pages > 1:
+                target.locator('#booking-previous').click()
+                assert target.locator('#booking-page').inner_text() == f'{pages-1} / {pages}ページ'
+        run_booking_test(f'STEP4 ページ境界 {count}件', pagination)
+
+    # 既存の境界テストに加え、画面の実データと表示範囲を独立した期待値で照合。
+    for boundary_count in [20, 21, 40, 41]:
+        for view in ['booking', 'admin']:
+            def page_contents(target, _, count=boundary_count, view=view):
+                seed(target, count)
+                raw = target.evaluate('''() => {
+                    const reversed = BookingStorage.read()
+                        .filter(item => item.status === 'confirmed').reverse();
+                    BookingStorage.write(reversed);
+                    reloadReservations();
+                    return localStorage.getItem(BookingStorage.key);
+                }''')
+                saved = json.loads(raw)['reservations']
+                assert [item['id'] for item in saved] == [f'step3-{i}' for i in reversed(range(count))]
+                target.evaluate('(hash) => { location.hash = hash; }', '#admin' if view == 'admin' else '#booking')
+                target.locator('#admin-view' if view == 'admin' else '#booking-view').wait_for(state='visible')
+                container = '#admin-reservation-list' if view == 'admin' else '#reservation-list'
+                pages = (count + 19) // 20
+                expected_names = ['山田 花子 様'] + [f'利用者{i} 様' for i in range(1, count)]
+                seen = []
+                assert target.locator(f'#{view}-previous').is_disabled()
+                for number in range(1, pages + 1):
+                    first = (number - 1) * 20
+                    last = min(number * 20, count)
+                    names = target.locator(container + ' .name').all_text_contents()
+                    assert names == expected_names[first:last], (view, count, number, names)
+                    assert target.locator(f'#{view}-range').inner_text() == f'全{count}件中 {first + 1}〜{last}件を表示'
+                    assert target.locator(f'#{view}-page').inner_text() == f'{number} / {pages}ページ'
+                    seen.extend(names)
+                    if number < pages:
+                        assert target.locator(f'#{view}-next').is_enabled()
+                        target.locator(f'#{view}-next').click()
+                assert seen == expected_names  # 全予約が日時順で表示され、欠落しない。
+                assert len(seen) == len(set(seen)) == count  # ページ間の重複なし。
+                assert target.locator(f'#{view}-next').is_disabled()
+                if pages > 1:
+                    target.locator(f'#{view}-previous').click()
+                    first = (pages - 2) * 20
+                    assert target.locator(container + ' .name').all_text_contents() == expected_names[first:first + 20]
+                    assert target.locator(f'#{view}-range').inner_text() == f'全{count}件中 {first + 1}〜{first + 20}件を表示'
+                assert target.evaluate('localStorage.getItem(BookingStorage.key)') == raw
+                assert read_bookings(target) == saved
+            run_booking_test(f'STEP4 逆順保存・表示内容/範囲・重複/欠落なし {view} {boundary_count}件', page_contents)
+
+    for view in ['booking', 'admin']:
+        def history_dates(target, _, view=view):
+            seed(target, 1)
+            raw = target.evaluate('''() => {
+                const items = BookingStorage.read();
+                const history = items.find(item => item.status === 'cancelled');
+                // JST 6/30 00:00は米国では6/29。ブラウザTZでの誤表示も検出する。
+                history.cancelledAt = Date.parse('2026-06-29T15:00:00Z');
+                BookingStorage.write(items);
+                reloadReservations();
+                return localStorage.getItem(BookingStorage.key);
+            }''')
+            history = next(item for item in json.loads(raw)['reservations'] if item['status'] == 'cancelled')
+            jst = timezone(timedelta(hours=9))
+            assert datetime.fromtimestamp(history['start'] / 1000, jst).date().isoformat() == '2026-06-29'
+            assert datetime.fromtimestamp(history['cancelledAt'] / 1000, jst).date().isoformat() == '2026-06-30'
+            target.evaluate('(hash) => { location.hash = hash; }', '#admin' if view == 'admin' else '#booking')
+            target.locator('#admin-view' if view == 'admin' else '#booking-view').wait_for(state='visible')
+            if view == 'admin':
+                target.locator('#admin-status').select_option('cancelled')
+            else:
+                target.locator('#cancelled-tab').click()
+            container = '#admin-reservation-list' if view == 'admin' else '#reservation-list'
+            target.locator(f'#{view}-date').fill('2026-06-29')
+            assert target.locator(container + ' .name').all_text_contents() == ['履歴の人 様']
+            assert 'キャンセル日時：2026/06/30(火) 00:00（日本時間）' in target.locator(container).inner_text()
+            target.locator(f'#{view}-search').fill('履歴')
+            assert target.locator(container + ' .name').all_text_contents() == ['履歴の人 様']
+            target.locator(f'#{view}-date').fill('2026-06-30')
+            assert target.locator(container + ' .reservation-card').count() == 0
+            assert '検索条件に一致する予約はありません' in target.locator(container).inner_text()
+            assert target.locator(f'#{view}-range').inner_text() == '全0件中 0〜0件を表示'
+            target.locator(f'#{view}-date').fill('2026-06-29')
+            assert target.locator(container + ' .name').all_text_contents() == ['履歴の人 様']
+            target.locator(f'#{view}-search').fill('山田')
+            assert target.locator(container + ' .reservation-card').count() == 0
+            assert target.evaluate('localStorage.getItem(BookingStorage.key)') == raw
+        run_booking_test(f'STEP4 元予約日6/29・取消日6/30・氏名複合検索・JST {view}', history_dates)
+
+    def reset(target, _):
+        seed(target)
+        target.locator('#booking-next').click()
+        target.locator('#booking-search').fill('user')
+        assert target.locator('#booking-page').inner_text().startswith('1 /')
+        target.locator('#booking-next').click()
+        target.locator('#booking-date').fill('2026-06-30')
+        assert target.locator('#booking-page').inner_text().startswith('1 /')
+        target.locator('#booking-clear-date').click()
+        target.locator('#booking-next').click()
+        target.locator('#cancelled-tab').click()
+        assert target.locator('#booking-page').inner_text() == '1 / 1ページ'
+    run_booking_test('STEP4 検索・日付・タブ変更でページリセット', reset)
+
+    def update(target, _):
+        seed(target, 21)
+        target.locator('#booking-next').click()
+        target.locator('#reservation-list button').click()
+        target.locator('#confirm-cancel').click()
+        assert target.locator('#booking-page').inner_text() == '1 / 1ページ'
+        assert target.locator('#confirmed-tab').inner_text() == '確定予約（20件）'
+        assert target.locator('#cancelled-tab').inner_text() == 'キャンセル履歴（2件）'
+        target.locator('#cancelled-tab').click()
+        assert target.locator('#reservation-list .reservation-card').count() == 2
+    run_booking_test('STEP4 キャンセル後の件数・ページ縮小補正', update)
+
+    def admin_filters(target, _):
+        seed(target)
+        target.goto(url + '#admin')
+        assert '全42件（確定 41件・キャンセル 1件）' in target.locator('#admin-reservation-count').inner_text()
+        assert target.locator('#admin-reservation-list .reservation-card').count() == 20
+        target.locator('#admin-next').click()
+        assert target.locator('#admin-page').inner_text() == '2 / 3ページ'
+        target.locator('#admin-status').select_option('cancelled')
+        assert target.locator('#admin-page').inner_text() == '1 / 1ページ'
+        assert target.locator('#admin-reservation-list .reservation-card').count() == 1
+        target.locator('#admin-status').select_option('confirmed')
+        target.locator('#admin-search').fill(' HANAKO ')
+        target.locator('#admin-date').fill('2026-06-29')
+        assert '全1件中' in target.locator('#admin-range').inner_text()
+        assert target.locator('#admin-reservation-list button').count() == 0
+        target.locator('#admin-status').select_option('all')
+        target.locator('#admin-search').fill('')
+        target.locator('#admin-clear-date').click()
+        assert '全42件中' in target.locator('#admin-range').inner_text()
+    run_booking_test('STEP4 管理者状態別・検索・日付・ページ・全件数', admin_filters)
+
+    def compatibility(target, _):
+        raw = seed(target)
+        original = read_bookings(target)
+        before = target.evaluate('JSON.stringify(reservations)')
+        target.evaluate("ReservationList.select(reservations, {query: 'user', page: 2})")
+        assert target.evaluate('JSON.stringify(reservations)') == before
+        target.reload()
+        assert read_bookings(target) == original
+        assert target.evaluate('localStorage.getItem(BookingStorage.key)') == raw
+        target.locator('#cancelled-tab').click()
+        assert '履歴の人' in target.locator('#reservation-list').inner_text()
+    run_booking_test('STEP4 STEP3形式互換・再読み込み・配列/保存の非破壊性', compatibility)
+
+    def layouts(target, _):
+        seed(target)
+        payload = '<img src=x onerror=window.listXSS=true>'
+        target.evaluate("""payload => {
+          reservations[0].name = payload;
+          reservations[0].email = 'a'.repeat(64) + '@' + 'b'.repeat(63) + '.' + 'c'.repeat(63) + '.' + 'd'.repeat(60);
+          reservations[1].name = '名'.repeat(100);
+          renderReservations();
+        }""", payload)
+        for width in [1440, 390]:
+            target.set_viewport_size({'width': width, 'height': 1000})
+            for route in ['#booking', '#admin']:
+                target.goto(url + route)
+                target.wait_for_function("document.getElementById(location.hash === '#admin' ? 'admin-view' : 'booking-view').hidden === false")
+                assert target.evaluate('document.documentElement.scrollWidth <= innerWidth')
+                container = '#admin-reservation-list' if route == '#admin' else '#reservation-list'
+                assert payload in target.locator(container).inner_text()
+                assert target.locator(container + ' img').count() == 0
+                assert target.evaluate('window.listXSS === undefined')
+                assert target.locator(container + ' .email').first.evaluate('(e) => e.scrollWidth <= e.clientWidth')
+                target.locator(container).scroll_into_view_if_needed()
+                if os.environ.get('TEST_ARTIFACT_DIR'):
+                    artifacts = Path(os.environ['TEST_ARTIFACT_DIR'])
+                    artifacts.mkdir(parents=True, exist_ok=True)
+                    target.screenshot(path=str(artifacts / f'step4-{width}-{route[1:]}.png'), full_page=True)
+        target.goto(url + '#booking')
+        target.locator('#booking-search').fill(payload)
+        assert '全1件中' in target.locator('#booking-range').inner_text()
+    run_booking_test('STEP4 長い氏名/メール・XSS・1440px/390px・両画面横幅', layouts)
 
     print(json.dumps({'sample_events': len(events), 'browser_errors': errors, 'passed': len(passed), 'failed': len(failures), 'test_groups': passed, 'failures': failures}, ensure_ascii=False))
     assert not failures, failures

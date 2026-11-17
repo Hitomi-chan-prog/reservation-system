@@ -88,11 +88,22 @@ function renderCalendar() {
   byId("calendar-body").replaceChildren(rows);
 }
 
+const listStates = {
+  booking: {status: 'confirmed', query: '', date: '', page: 1},
+  admin: {status: 'all', query: '', date: '', page: 1}
+};
 function renderReservations() {
-  const sorted = [...reservations].sort((a, b) => a.start - b.start || a.createdAt - b.createdAt);
-  for (const [containerId, withActions] of [['reservation-list', true], ['admin-reservation-list', false]]) {
+  const confirmed = reservations.filter(item => item.status === 'confirmed').length;
+  const cancelled = reservations.filter(item => item.status === 'cancelled').length;
+  byId('confirmed-tab').textContent = `確定予約（${confirmed}件）`;
+  byId('cancelled-tab').textContent = `キャンセル履歴（${cancelled}件）`;
+  byId('reservation-count').textContent = `${reservations.length}件`;
+  byId('admin-reservation-count').textContent = `全${reservations.length}件（確定 ${confirmed}件・キャンセル ${cancelled}件）`;
+  for (const [prefix, containerId, withActions] of [['booking', 'reservation-list', true], ['admin', 'admin-reservation-list', false]]) {
+    const result = ReservationList.select(reservations, listStates[prefix]);
+    listStates[prefix].page = result.page;
     const cards = document.createDocumentFragment();
-    sorted.forEach((reservation) => {
+    result.items.forEach((reservation) => {
       const card = createTextElement("article", "", "reservation-card");
       const top = createTextElement("div", "", "card-top");
       const detail = createTextElement("div", "", "reservation-detail");
@@ -102,11 +113,10 @@ function renderReservations() {
       if (reservation.status === 'confirmed' && [...importedEvents.values()].some((event) => event.status !== 'CANCELLED' && Calendar.overlaps(event, reservation))) {
         card.append(createTextElement('p', 'ICS予定と競合しています。予約は保持されています。', 'conflict-warning'));
       }
-      if (withActions) {
+      if (withActions && reservation.status === 'confirmed') {
         const actions = createTextElement("div", "", "card-actions");
         const cancel = createTextElement("button", "キャンセル", "button");
         cancel.type = "button";
-        cancel.disabled = reservation.status !== 'confirmed';
         cancel.addEventListener('click', () => {
           cancelId = reservation.id;
           byId('cancel-detail').textContent = `${bookingLabel(reservation)} / ${reservation.name} / ${reservation.email}`;
@@ -116,14 +126,64 @@ function renderReservations() {
         actions.append(cancel);
         card.append(actions);
       }
+      if (reservation.status === 'cancelled') {
+        card.append(createTextElement('p', `キャンセル日時：${tokyoDate(reservation.cancelledAt)} ${tokyoTime(reservation.cancelledAt)}（日本時間）`, 'description'));
+      }
       cards.append(card);
     });
-    if (!sorted.length) cards.append(createTextElement('p', '予約はまだありません', 'description'));
+    if (!result.total) {
+      const state = listStates[prefix];
+      const message = state.query.trim() || state.date ? '検索条件に一致する予約はありません' :
+        state.status === 'cancelled' ? 'キャンセル履歴はまだありません' : '予約はまだありません';
+      cards.append(createTextElement('p', message, 'description'));
+    }
     byId(containerId).replaceChildren(cards);
+    byId(`${prefix}-range`).textContent = `全${result.total}件中 ${result.first}〜${result.last}件を表示`;
+    byId(`${prefix}-page`).textContent = `${result.page} / ${result.pages}ページ`;
+    byId(`${prefix}-previous`).disabled = result.page === 1;
+    byId(`${prefix}-next`).disabled = result.page === result.pages;
   }
-  const count = `${sorted.length}件（確定 ${sorted.filter((item) => item.status === 'confirmed').length}件）`;
-  byId("reservation-count").textContent = count;
-  byId('admin-reservation-count').textContent = count;
+}
+for (const prefix of ['booking', 'admin']) {
+  for (const [field, property] of [['search', 'query'], ['date', 'date'], ...(prefix === 'admin' ? [['status', 'status']] : [])]) {
+    byId(`${prefix}-${field}`).addEventListener('input', event => {
+      listStates[prefix][property] = event.target.value;
+      listStates[prefix].page = 1;
+      renderReservations();
+    });
+  }
+  byId(`${prefix}-clear-date`).addEventListener('click', () => {
+    byId(`${prefix}-date`).value = '';
+    listStates[prefix].date = '';
+    listStates[prefix].page = 1;
+    renderReservations();
+  });
+  for (const [direction, delta] of [['previous', -1], ['next', 1]]) {
+    byId(`${prefix}-${direction}`).addEventListener('click', () => {
+      listStates[prefix].page += delta;
+      renderReservations();
+    });
+  }
+}
+for (const status of ['confirmed', 'cancelled']) {
+  const tab = byId(`${status}-tab`);
+  tab.addEventListener('click', () => {
+    listStates.booking.status = status;
+    listStates.booking.page = 1;
+    for (const value of ['confirmed', 'cancelled']) {
+      byId(`${value}-tab`).setAttribute('aria-selected', String(value === status));
+      byId(`${value}-tab`).tabIndex = value === status ? 0 : -1;
+    }
+    byId('reservation-panel').setAttribute('aria-labelledby', tab.id);
+    renderReservations();
+  });
+  tab.addEventListener('keydown', event => {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+    event.preventDefault();
+    const next = event.key === 'Home' ? 'confirmed' : event.key === 'End' ? 'cancelled' : status === 'confirmed' ? 'cancelled' : 'confirmed';
+    byId(`${next}-tab`).click();
+    byId(`${next}-tab`).focus();
+  });
 }
 function updateBookingHint() {
   byId('confirm-booking').disabled = !icsReady();

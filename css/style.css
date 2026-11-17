@@ -761,3 +761,14 @@ td.reserved {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+.list-controls { display: grid; gap: 8px; margin-top: 16px; min-width: 0; }
+.list-controls label, .pagination { font-size: 11px; }
+.list-controls input, .list-controls select { width: 100%; min-width: 0; padding: 8px; border: 1px solid var(--line); background: #fffdf7; color: var(--ink); font: inherit; }
+.reservation-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 16px; }
+.reservation-tabs [aria-selected="true"] { background: var(--accent); color: white; }
+.pagination { margin: 16px 0; }
+.pagination > div { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.pagination .button { padding: 5px; }
+button:disabled { opacity: .5; cursor: default; }
+.list-controls .button { justify-self: start; }
