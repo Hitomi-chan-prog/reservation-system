@@ -499,6 +499,10 @@ dialog::backdrop {
   font-weight: 600;
 }
 
+#cancel-detail {
+  overflow-wrap: anywhere;
+}
+
 dialog label {
   display: block;
   font-size: 12px;
@@ -736,4 +740,24 @@ dialog input {
     display: none;
   }
 
+}
+
+.error-message,.conflict-warning {
+  color: #934c40;
+  font-size: 12px;
+  margin-top: 10px;
+  overflow-wrap: anywhere;
+}
+
+/* 長い利用者入力はカード内で折り返し、枠内では省略する。 */
+.reservation-detail {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+td.reserved {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }

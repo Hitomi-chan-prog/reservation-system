@@ -16,7 +16,7 @@ with sync_playwright() as p:
     page.on('pageerror', lambda error: errors.append(str(error)))
     page.goto(os.environ.get('TEST_URL', (ROOT / 'index.html').as_uri()))
     assert page.locator('#calendar-body td').count() == 90
-    assert page.locator('td.reserved').count() == 2
+    assert page.locator('td.reserved').count() == 0
     assert page.locator('td.busy').count() == 0
     page.locator('#ics-file').set_input_files(str(SAMPLE))
     page.evaluate('async () => { await importQueue; }')
@@ -42,9 +42,9 @@ with sync_playwright() as p:
     assert page.locator('#calendar-body tr').nth(2).locator('td').nth(2).get_attribute('class') == 'busy'
     assert page.locator('#calendar-body tr').nth(3).locator('td').nth(2).locator('button').count() == 1
     page.locator('td.busy').first.click()
-    assert not page.locator('dialog').evaluate('(e) => e.open')
+    assert not page.locator('#reservation-dialog').evaluate('(e) => e.open')
     page.locator('td button').first.click()
-    assert page.locator('dialog').evaluate('(e) => e.open')
+    assert page.locator('#reservation-dialog').evaluate('(e) => e.open')
     page.locator('.close-button').click()
     page.locator('#ics-file').set_input_files(str(SAMPLE))
     page.evaluate('async () => { await importQueue; }')
@@ -226,7 +226,7 @@ with sync_playwright() as p:
     assert page.locator('#calendar-body img, #calendar-body script').count() == 0
     assert page.evaluate('window.icsXSS === undefined')
     busy.click()
-    assert not page.locator('dialog').evaluate('(element) => element.open')
+    assert not page.locator('#reservation-dialog').evaluate('(element) => element.open')
     passed.append('ICS由来HTMLの安全な表示')
     page.locator('#clear-files').click()
 
@@ -240,5 +240,509 @@ with sync_playwright() as p:
     page.wait_for_function('document.getElementById("import-error").textContent.includes("読み込めません")')
     assert page.evaluate('importedEvents.size') == 300
     assert not errors, errors
-    print(json.dumps({'sample_events': len(events), 'overlap_states': results, 'browser_errors': errors, 'passed': len(passed), 'failed': 0, 'test_groups': passed, 'result': 'PASS'}, ensure_ascii=False))
+    # STEP 3: 各テストで新しいブラウザコンテキストを使い保存領域を分離する。
+    failures = []
+    url = os.environ.get('TEST_URL', (ROOT / 'index.html').as_uri())
+    empty_ics = 'BEGIN:VCALENDAR\nVERSION:2.0\nEND:VCALENDAR\n'
+
+    def freeze(target):
+        baseline = datetime(2026, 6, 29, tzinfo=timezone.utc)
+        # install後のわずかな経過時間を吸収し、未来の基準時刻へ進めて停止する。
+        target.clock.install(time=baseline - timedelta(days=1))
+        target.clock.pause_at(baseline)
+
+    def read_bookings(target):
+        return target.evaluate('BookingStorage.read()')
+
+    def load_ics(target, source=empty_ics, name='empty.ics'):
+        target.locator('#ics-file').set_input_files(file(name, source))
+        target.evaluate('async () => { await importQueue; }')
+
+    def slot(target, index=2):
+        return target.locator('#calendar-body tr').nth(index).locator('td').nth(0)
+
+    def open_booking(target, index=2):
+        slot(target, index).locator('button').click()
+        target.locator('#customer-name').fill('  山田 花子  ')
+        target.locator('#customer-email').fill('  hanako@example.com  ')
+
+    def book(target, index=2):
+        load_ics(target)
+        open_booking(target, index)
+        target.locator('#confirm-booking').click()
+        assert not target.locator('#reservation-dialog').evaluate('(e) => e.open'), target.locator('#booking-error').inner_text()
+
+    def run_booking_test(label, callback, timezone_id='America/Los_Angeles'):
+        isolated = browser.new_context(timezone_id=timezone_id)
+        target = isolated.new_page()
+        page_errors = []
+        isolated.on('page', lambda other: other.on('pageerror', lambda error: page_errors.append(str(error))))
+        target.on('pageerror', lambda error: page_errors.append(str(error)))
+        try:
+            freeze(target)
+            target.goto(url)
+            callback(target, isolated)
+            assert not page_errors, page_errors
+            passed.append(label)
+        except Exception as error:
+            failures.append({'test': label, 'error': str(error)})
+        finally:
+            errors.extend(page_errors)
+            isolated.close()
+
+    def registration(target, _):
+        assert '予約はまだありません' in target.locator('#reservation-list').inner_text()
+        book(target)
+        saved = read_bookings(target)
+        assert len(saved) == 1
+        item = saved[0]
+        assert item['name'] == '山田 花子' and item['email'] == 'hanako@example.com'
+        assert item['end'] - item['start'] == 1800000
+        assert item['status'] == 'confirmed' and item['cancelledAt'] is None
+        assert item['id'] and item['createdAt'] == int(datetime(2026, 6, 29, tzinfo=timezone.utc).timestamp() * 1000)
+        assert '予約を登録しました' in target.locator('#operation-status').inner_text()
+        assert slot(target).get_attribute('class') == 'reserved'
+        assert slot(target).locator('button').count() == 0
+    run_booking_test('STEP3 予約登録・入力正規化・一覧即時反映', registration)
+
+    def invalid_inputs(target, _):
+        load_ics(target)
+        open_booking(target)
+        for name, email in [('', ''), ('   ', 'a@example.com'), ('a', ''), ('a', 'bad'), ('a' * 101, 'a@example.com'), ('a', 'a' * 243 + '@example.com')]:
+            target.locator('#customer-name').fill(name)
+            target.locator('#customer-email').fill(email)
+            target.locator('#confirm-booking').click()
+            assert target.locator('#booking-error').inner_text()
+            assert not read_bookings(target)
+        # 上限ちょうどは受理する。
+        target.locator('#customer-name').fill('あ' * 100)
+        target.locator('#customer-email').fill('a' * 242 + '@example.com')
+        target.locator('#confirm-booking').click()
+        assert len(read_bookings(target)) == 1
+    run_booking_test('STEP3 必須・メール形式・100文字と254文字境界', invalid_inputs)
+
+    def duplicate(target, _):
+        book(target)
+        result = target.evaluate('''() => {
+            try { Reservations.register({...reservations[0],name:'他の人',email:'b@example.com',icsReady:true,events:[]}); return ''; }
+            catch (error) { return error.message; }
+        }''')
+        assert '予約' in result and len(read_bookings(target)) == 1
+    run_booking_test('STEP3 同一枠への再予約拒否', duplicate)
+
+    def busy_slot(target, _):
+        load_ics(target, event('busy', start='20260629T100000', end='20260629T103000'))
+        assert slot(target).get_attribute('class') == 'busy'
+        assert slot(target).locator('button').count() == 0
+        slot(target).click()
+        assert not target.locator('#reservation-dialog').evaluate('(e) => e.open')
+        target.evaluate('openReservationDialog(dateAt(0),2)')
+        target.locator('#customer-name').fill('a')
+        target.locator('#customer-email').fill('a@example.com')
+        target.locator('#confirm-booking').click()
+        assert 'ICS予定' in target.locator('#booking-error').inner_text()
+        assert not read_bookings(target)
+    run_booking_test('STEP3 ICS予定枠の表示・登録拒否', busy_slot)
+
+    def unloaded(target, _):
+        open_booking(target)
+        assert target.locator('#confirm-booking').is_disabled()
+        target.locator('#booking-form').evaluate('(form) => form.requestSubmit()')
+        assert 'ICS' in target.locator('#booking-error').inner_text()
+        assert not read_bookings(target)
+    run_booking_test('STEP3 ICS未読み込み時の確定拒否', unloaded)
+
+    def past(target, _):
+        load_ics(target)
+        open_booking(target, 0) # 現在の9:00と同時
+        target.locator('#confirm-booking').click()
+        assert '開始済み' in target.locator('#booking-error').inner_text()
+        target.locator('#dismiss-booking').click()
+        target.locator('#previous-week').click()
+        open_booking(target)
+        target.locator('#confirm-booking').click()
+        assert not read_bookings(target)
+    run_booking_test('STEP3 過去・開始時刻一致の予約拒否', past)
+
+    def recheck_ics(target, _):
+        load_ics(target)
+        open_booking(target)
+        # ダイアログ表示後にICS更新。実際の読み込み処理を通す。
+        target.evaluate('''source => showSelectedFiles([new File([source],'late.ics')])''', event('late', start='20260629T101500', end='20260629T104500'))
+        target.evaluate('async () => { await importQueue; }')
+        target.locator('#confirm-booking').click()
+        assert 'ICS予定' in target.locator('#booking-error').inner_text()
+        assert not read_bookings(target)
+    run_booking_test('STEP3 確定直前ICS再判定', recheck_ics)
+
+    def recheck_storage(target, _):
+        load_ics(target)
+        open_booking(target)
+        # storageイベントを待つ前でも、確定時の再読込で他予約を検出する。
+        target.evaluate('''() => {
+            const range=Calendar.slotRange(dateAt(0),2);
+            BookingStorage.write([{id:'external',name:'別予約',email:'other@example.com',...range,status:'confirmed',createdAt:Date.now(),cancelledAt:null}]);
+        }''')
+        target.locator('#confirm-booking').click()
+        assert '予約' in target.locator('#booking-error').inner_text()
+        assert len(read_bookings(target)) == 1
+        assert slot(target).get_attribute('class') == 'reserved'
+    run_booking_test('STEP3 確定直前localStorage再判定', recheck_storage)
+
+    def persistence(target, _):
+        book(target)
+        raw = target.evaluate('JSON.parse(localStorage.getItem(BookingStorage.key))')
+        assert raw['version'] == 1 and len(raw['reservations']) == 1
+        assert set(raw) == {'version', 'reservations'}
+        target.reload()
+        assert len(read_bookings(target)) == 1
+        assert slot(target).get_attribute('class') == 'reserved'
+        assert target.evaluate('importedEvents.size === 0 && importedFiles.size === 0')
+        open_booking(target, 3)
+        assert target.locator('#confirm-booking').is_disabled()
+    run_booking_test('STEP3 保存・再読み込み復元・ICS再読込必須', persistence)
+
+    def cancel_booking(target, _):
+        book(target)
+        target.locator('#reservation-list button').click()
+        assert target.locator('#cancel-dialog').evaluate('(e) => e.open')
+        assert '山田 花子' in target.locator('#cancel-detail').inner_text()
+        target.locator('#dismiss-cancel').click()
+        assert read_bookings(target)[0]['status'] == 'confirmed'
+        target.locator('#reservation-list button').click()
+        target.locator('#confirm-cancel').click()
+        saved = read_bookings(target)[0]
+        assert saved['status'] == 'cancelled' and saved['cancelledAt'] is not None
+        assert slot(target).locator('button').count() == 1
+        assert target.locator('#reservation-list button').is_disabled()
+        result = target.evaluate('''() => { try { Reservations.cancel(reservations[0].id); return ''; } catch(e) { return e.message; } }''')
+        assert 'キャンセル済み' in result
+        target.reload()
+        assert read_bookings(target)[0]['status'] == 'cancelled'
+        assert 'キャンセル済み' in target.locator('#reservation-list').inner_text()
+    run_booking_test('STEP3 キャンセル確認・解除・再取消拒否・再読込保持', cancel_booking)
+
+    def conflict(target, _):
+        book(target)
+        load_ics(target, event('conflict', start='20260629T100000', end='20260629T103000'))
+        assert '競合' in target.locator('#conflict-warning').inner_text()
+        assert read_bookings(target)[0]['status'] == 'confirmed'
+        assert slot(target).get_attribute('class') == 'reserved'
+        target.locator('#reservation-list button').click()
+        target.locator('#confirm-cancel').click()
+        assert slot(target).get_attribute('class') == 'busy'
+    run_booking_test('STEP3 ICS競合警告・予約保護・取消後ICS枠維持', conflict)
+
+    def corrupt_storage(target, _):
+        for raw in ['not-json', '{"version":2,"reservations":[]}', '{"version":1,"reservations":[{}]}']:
+            target.evaluate('raw => localStorage.setItem(BookingStorage.key,raw)', raw)
+            target.reload()
+            assert '不正' in target.locator('#storage-error').inner_text()
+            load_ics(target)
+            open_booking(target)
+            target.locator('#confirm-booking').click()
+            assert '不正' in target.locator('#booking-error').inner_text()
+            assert target.evaluate('localStorage.getItem(BookingStorage.key)') == raw
+            assert not target.locator('#operation-status').inner_text()
+            target.locator('#dismiss-booking').click()
+    run_booking_test('STEP3 不正保存データ・未知バージョンを保護', corrupt_storage)
+
+    def save_failure(target, _):
+        load_ics(target)
+        open_booking(target)
+        target.evaluate('''() => { Storage.prototype.setItem = function() { throw new DOMException('full','QuotaExceededError'); }; }''')
+        target.locator('#confirm-booking').click()
+        assert '保存できません' in target.locator('#booking-error').inner_text()
+        assert not read_bookings(target)
+        assert not target.locator('#operation-status').inner_text()
+        assert slot(target).get_attribute('class') != 'reserved'
+    run_booking_test('STEP3 容量不足時に成功扱いしない', save_failure)
+
+    def denied_storage(target, _):
+        target.evaluate('''() => { Storage.prototype.getItem = function() { throw new DOMException('denied','SecurityError'); }; }''')
+        target.evaluate('reloadReservations()')
+        assert 'アクセスできません' in target.locator('#storage-error').inner_text()
+        load_ics(target)
+        open_booking(target)
+        target.locator('#confirm-booking').click()
+        assert 'アクセスできません' in target.locator('#booking-error').inner_text()
+        assert not target.locator('#operation-status').inner_text()
+    run_booking_test('STEP3 localStorageアクセス拒否', denied_storage)
+
+    def cancel_failure(target, _):
+        book(target)
+        target.locator('#reservation-list button').click()
+        target.evaluate('''() => { Storage.prototype.setItem = function() { throw new Error('denied'); }; }''')
+        target.locator('#confirm-cancel').click()
+        assert '保存できません' in target.locator('#cancel-error').inner_text()
+        assert read_bookings(target)[0]['status'] == 'confirmed'
+        assert slot(target).get_attribute('class') == 'reserved'
+    run_booking_test('STEP3 キャンセル保存失敗時の予約保持', cancel_failure)
+
+    def tabs(target, isolated):
+        other = isolated.new_page()
+        freeze(other)
+        other.goto(url)
+        book(target)
+        other.wait_for_function('reservations.length === 1')
+        assert other.locator('td.reserved').count() == 1
+        assert '山田 花子' in other.locator('#admin-reservation-list').inner_text()
+        other.locator('#reservation-list button').click()
+        other.locator('#confirm-cancel').click()
+        target.wait_for_function('reservations[0].status === "cancelled"')
+        assert target.locator('td.reserved').count() == 0
+        assert 'キャンセル済み' in target.locator('#admin-reservation-list').inner_text()
+        other.evaluate('localStorage.removeItem(BookingStorage.key)')
+        target.wait_for_function('reservations.length === 0')
+    run_booking_test('STEP3 実際の別タブstorageイベント・管理者更新', tabs)
+
+    def admin_sort(target, _):
+        book(target, 4)
+        open_booking(target, 2)
+        target.locator('#confirm-booking').click()
+        target.locator('a[href="#admin"]').click()
+        assert target.locator('#admin-view').is_visible()
+        assert '2件' in target.locator('#admin-reservation-count').inner_text()
+        labels = target.locator('#admin-reservation-list strong').all_inner_texts()
+        assert '10:00' in labels[0] and '11:00' in labels[1]
+        assert '認証なし' in target.locator('#admin-view').inner_text()
+        # 時間経過後も過去の予約が一覧に残る。
+        target.clock.run_for(86400000)
+        assert target.locator('#admin-reservation-list .reservation-card').count() == 2
+    run_booking_test('STEP3 管理者一覧・日時順・過去予約表示', admin_sort)
+
+    def xss_input(target, _):
+        load_ics(target)
+        open_booking(target)
+        payload = '<img src=x onerror="window.bookingXSS=true">'
+        target.locator('#customer-name').fill(payload)
+        target.locator('#customer-email').fill('xss@example.com')
+        target.locator('#confirm-booking').click()
+        assert payload in target.locator('#reservation-list').inner_text()
+        assert target.locator('#reservation-list img, #admin-reservation-list img').count() == 0
+        assert target.evaluate('window.bookingXSS === undefined')
+        open_booking(target, 3)
+        target.locator('#customer-email').fill('<script>alert(1)</script>@example.com')
+        target.locator('#confirm-booking').click()
+        assert len(read_bookings(target)) == 1
+        assert target.locator('#booking-error').inner_text()
+        target.reload()
+        assert target.evaluate('window.bookingXSS === undefined')
+        assert payload in target.locator('#admin-reservation-list').inner_text()
+    run_booking_test('STEP3 氏名XSS安全表示・不正メール拒否・復元時安全性', xss_input)
+
+    def boundaries(target, _):
+        result = target.evaluate('''() => {
+            const d = new Date(Date.UTC(2026,5,29));
+            return [0,17,18,-1].map(slot => {
+                const range=Calendar.slotRange(d,slot);
+                return Reservations.validRange(range.start,range.end);
+            });
+        }''')
+        assert result == [True, True, False, False]
+        assert not target.evaluate('''() => { const r=Calendar.slotRange(new Date(Date.UTC(2026,6,4)),2);return Reservations.validRange(r.start,r.end); }''')
+        assert not target.evaluate('''() => { const r=Calendar.slotRange(dateAt(0),2);return Reservations.validRange(r.start+1,r.end+1); }''')
+        # 17:30〜18:00は受理、翌枠と端が一致しても重複しない。
+        book(target, 17)
+        assert '17:30–18:00' in target.locator('#reservation-list').inner_text()
+        assert slot(target, 16).locator('button').count() == 1
+    run_booking_test('STEP3 営業時間・曜日・30分枠・終了境界', boundaries, 'Asia/Tokyo')
+
+    def midnight(target, _):
+        target.clock.run_for(15 * 3600000) # UTC15:00 = 東京の翌日0時
+        assert target.evaluate('Calendar.today().toISOString()') == '2026-06-30T00:00:00.000Z'
+        load_ics(target)
+        open_booking(target)
+        target.locator('#confirm-booking').click()
+        assert '過去' in target.locator('#booking-error').inner_text()
+        target.locator('#dismiss-booking').click()
+        # 火曜9:00は未来なので受理。
+        target.locator('#calendar-body tr').nth(0).locator('td').nth(1).locator('button').click()
+        target.locator('#customer-name').fill('翌日')
+        target.locator('#customer-email').fill('next@example.com')
+        target.locator('#confirm-booking').click()
+        assert '2026/06/30' in target.locator('#reservation-list').inner_text()
+    run_booking_test('STEP3 東京の日付変更・ブラウザTZ差', midnight)
+
+    def id_fallback(target, _):
+        target.evaluate('''() => { Object.defineProperty(window.crypto,'randomUUID',{value:undefined,configurable:true}); }''')
+        book(target)
+        assert re.fullmatch(r'[0-9a-f]{32}', read_bookings(target)[0]['id'])
+    run_booking_test('STEP3 randomUUIDなしの安全なID代替', id_fallback)
+
+    def time_recheck(target, _):
+        load_ics(target)
+        open_booking(target)
+        target.clock.run_for(3600000) # ダイアログ中に10:00へ
+        target.locator('#confirm-booking').click()
+        assert '開始済み' in target.locator('#booking-error').inner_text()
+        assert not read_bookings(target)
+    run_booking_test('STEP3 ダイアログ中の時刻経過を確定時再判定', time_recheck)
+
+    def invalid_records(target, _):
+        book(target)
+        saved = read_bookings(target)[0]
+        bad_records = [
+            [{**saved, 'start': saved['start'] + 1}],
+            [{**saved, 'status': 'unknown'}],
+            [{**saved, 'cancelledAt': 1}],
+            [{**saved, 'createdAt': 'now'}],
+            [saved, saved],
+            [saved, {**saved, 'id': 'other'}],
+        ]
+        for records in bad_records:
+            raw = json.dumps({'version': 1, 'reservations': records})
+            target.evaluate('raw => localStorage.setItem(BookingStorage.key, raw)', raw)
+            target.reload()
+            assert '不正' in target.locator('#storage-error').inner_text()
+            assert target.evaluate('localStorage.getItem(BookingStorage.key)') == raw
+    run_booking_test('STEP3 保存データの時刻・状態・ID重複・枠重複検証', invalid_records)
+
+    def pending_import(target, _):
+        load_ics(target)
+        open_booking(target)
+        target.evaluate('''() => {
+            window.NativeReader=window.FileReader;
+            window.FileReader=class { readAsText() {window.readerInFlight=this;} };
+            showSelectedFiles([new File(['pending'],'pending.ics')]);
+        }''')
+        target.wait_for_function('Boolean(window.readerInFlight)')
+        assert target.locator('#confirm-booking').is_disabled()
+        target.locator('#booking-form').evaluate('(form) => form.requestSubmit()')
+        assert 'ICS' in target.locator('#booking-error').inner_text()
+        assert not read_bookings(target)
+        target.evaluate(r'''async () => {
+            window.FileReader=window.NativeReader;
+            readerInFlight.result='BEGIN:VCALENDAR\nVERSION:2.0\nEND:VCALENDAR';
+            readerInFlight.onload();
+            await importQueue;
+        }''')
+        assert target.locator('#confirm-booking').is_enabled()
+    run_booking_test('STEP3 ICS読み込み中の確定禁止・完了後解除', pending_import)
+
+    # ブラウザプロセスを終了し、同じ永続プロフィールで再起動する。
+    # テスト後はプロフィールを削除し、個人情報・保存領域を残さない。
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix='booking-browser-') as profile:
+        restart_errors = []
+        try:
+            persistent = p.chromium.launch_persistent_context(profile, executable_path='/usr/bin/chromium', headless=True, args=['--no-sandbox'], timezone_id='America/Los_Angeles')
+            target = persistent.new_page()
+            target.on('pageerror', lambda error: restart_errors.append(str(error)))
+            freeze(target)
+            target.goto(url)
+            book(target)
+            saved = read_bookings(target)
+            persistent.close()
+            persistent = p.chromium.launch_persistent_context(profile, executable_path='/usr/bin/chromium', headless=True, args=['--no-sandbox'], timezone_id='Asia/Tokyo')
+            target = persistent.new_page()
+            target.on('pageerror', lambda error: restart_errors.append(str(error)))
+            freeze(target)
+            target.goto(url)
+            assert read_bookings(target) == saved
+            assert slot(target).get_attribute('class') == 'reserved'
+            open_booking(target, 3)
+            assert target.locator('#confirm-booking').is_disabled()
+            assert not restart_errors, restart_errors
+            passed.append('STEP3 ブラウザ終了・再起動後の永続復元')
+        except Exception as error:
+            failures.append({'test': 'STEP3 ブラウザ終了・再起動後の永続復元', 'error': str(error)})
+        finally:
+            persistent.close()
+            errors.extend(restart_errors)
+
+    def long_name_layout(target, _):
+        payload = 'A' * 100
+        load_ics(target)
+        open_booking(target)
+        target.locator('#customer-name').fill(payload)
+        target.locator('#confirm-booking').click()
+        assert not target.locator('#reservation-dialog').evaluate('(e) => e.open')
+        assert read_bookings(target)[0]['name'] == payload
+        assert payload in target.locator('#reservation-list .name').inner_text()
+        reserved = target.locator('td.reserved')
+        assert reserved.inner_text() == payload
+        assert reserved.get_attribute('title') == payload
+        assert payload in reserved.get_attribute('aria-label')
+        for width in [1440, 390]:
+            target.set_viewport_size({'width': width, 'height': 900})
+            for route, container in [('#booking', '#reservation-list'), ('#admin', '#admin-reservation-list')]:
+                target.evaluate('(route) => { location.hash = route; }', route)
+                target.wait_for_function('(hash) => location.hash === hash && !document.getElementById(hash === "#admin" ? "admin-view" : "booking-view").hidden', arg=route)
+                assert target.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), (width, route)
+                assert target.locator(container + ' .name').evaluate('''name => {
+                    const card = name.closest('.reservation-card');
+                    const bounds = card.getBoundingClientRect();
+                    const text = name.getBoundingClientRect();
+                    return text.left >= bounds.left && text.right <= bounds.right &&
+                        card.scrollWidth <= card.clientWidth && name.scrollWidth <= name.clientWidth;
+                }'''), (width, route)
+            target.evaluate('location.hash = "#booking"')
+            target.wait_for_function('!document.getElementById("booking-view").hidden')
+            assert reserved.evaluate('''cell => {
+                const style = getComputedStyle(cell);
+                return style.overflowX === 'hidden' && style.textOverflow === 'ellipsis' &&
+                    style.whiteSpace === 'nowrap' && cell.scrollWidth > cell.clientWidth &&
+                    cell.getBoundingClientRect().right <= cell.nextElementSibling.getBoundingClientRect().left + 1;
+            }'''), width
+        target.reload()
+        assert read_bookings(target)[0]['name'] == payload
+        assert payload in target.locator('td.reserved').get_attribute('aria-label')
+    run_booking_test('STEP3 長い氏名100文字・1440px/390px・カード内折返し・枠省略・完全名保持', long_name_layout)
+
+    def repeated_clock(target, isolated):
+        for _ in range(10):
+            another = isolated.new_page()
+            try:
+                freeze(another)
+                assert another.evaluate('Date.now()') == int(datetime(2026, 6, 29, tzinfo=timezone.utc).timestamp() * 1000)
+            finally:
+                another.close()
+    run_booking_test('STEP3 時計初期化10回反復', repeated_clock)
+
+    def cancel_dialog_overflow(target, _):
+        name = 'A' * 100
+        email = 'a' * 242 + '@example.com'  # 最大254文字の正常な形式
+        load_ics(target)
+        open_booking(target)
+        target.locator('#customer-name').fill(name)
+        target.locator('#customer-email').fill(email)
+        target.locator('#confirm-booking').click()
+        assert not target.locator('#reservation-dialog').evaluate('(e) => e.open')
+        for width in [390, 1440]:
+            target.set_viewport_size({'width': width, 'height': 900})
+            target.locator('#reservation-list button').click()
+            dialog = target.locator('#cancel-dialog')
+            assert dialog.evaluate('(e) => e.open')
+            detail = target.locator('#cancel-detail')
+            assert name in detail.inner_text() and email in detail.inner_text()
+            assert detail.evaluate('''element => {
+                const dialog = element.closest('dialog');
+                const style = getComputedStyle(element);
+                const range = document.createRange();
+                range.selectNodeContents(element);
+                const bounds = element.getBoundingClientRect();
+                return style.overflowWrap === 'anywhere' && style.textOverflow !== 'ellipsis' &&
+                    element.scrollWidth <= element.clientWidth && dialog.scrollWidth <= dialog.clientWidth &&
+                    Array.from(range.getClientRects()).every(rect => rect.left >= bounds.left && rect.right <= bounds.right + 1);
+            }'''), width
+            assert target.evaluate('document.documentElement.scrollWidth <= innerWidth'), width
+            # 確認画面を閉じても予約と保存内容は変わらない。
+            before = read_bookings(target)
+            target.locator('#dismiss-cancel').click()
+            assert not dialog.evaluate('(e) => e.open')
+            assert read_bookings(target) == before
+            assert before[0]['status'] == 'confirmed'
+        target.locator('#reservation-list button').click()
+        target.locator('#confirm-cancel').click()
+        assert not target.locator('#cancel-dialog').evaluate('(e) => e.open')
+        saved = read_bookings(target)[0]
+        assert saved['status'] == 'cancelled' and saved['cancelledAt'] is not None
+        assert saved['name'] == name and saved['email'] == email
+        assert slot(target).locator('button').count() == 1
+    run_booking_test('STEP3 キャンセル確認の長い氏名・254文字メール・390px/1440px・中止と確定', cancel_dialog_overflow)
+
+    print(json.dumps({'sample_events': len(events), 'browser_errors': errors, 'passed': len(passed), 'failed': len(failures), 'test_groups': passed, 'failures': failures}, ensure_ascii=False))
+    assert not failures, failures
+
     browser.close()
