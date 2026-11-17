@@ -9,6 +9,7 @@
     <script src="js/calendar.js" defer></script>
     <script src="js/reservations.js" defer></script>
     <script src="js/storage.js" defer></script>
+    <script src="js/reservation-list.js" defer></script>
     <script src="js/app.js" defer></script>
   </head>
   <body>
@@ -57,7 +58,7 @@
               </h2>
               <p class="description">緑の空き枠をクリックすると、予約入力画面が開きます。</p>
             </div>
-            <span class="demo-label">STEP 3 / LOCAL</span>
+            <span class="demo-label">STEP 4 / LOCAL</span>
           </div>
           <div class="calendar-toolbar">
             <nav class="week-navigation" aria-label="表示する週">
@@ -99,7 +100,22 @@
               <p class="description">
                 このブラウザに保存された予約です。本人認証はありません。
               </p>
-              <div id="reservation-list"></div>
+              <div class="reservation-tabs" role="tablist" aria-label="予約の状態">
+<button id="confirmed-tab" class="button" type="button" role="tab" aria-controls="reservation-panel" aria-selected="true">確定予約</button>
+<button id="cancelled-tab" class="button" type="button" role="tab" aria-controls="reservation-panel" aria-selected="false" tabindex="-1">キャンセル履歴</button>
+</div><div class="list-controls">
+
+    <label for="booking-search">氏名・メールアドレス検索</label>
+    <input id="booking-search" type="search" placeholder="氏名またはメールの一部">
+    <label for="booking-date">予約日（日本時間・履歴は元の予約日）</label>
+    <input id="booking-date" type="date">
+    <button id="booking-clear-date" class="button" type="button">日付をクリア</button>
+    </div><div id="reservation-panel" role="tabpanel" aria-labelledby="confirmed-tab"><div id="reservation-list"></div></div><nav class="pagination" aria-label="予約一覧のページ切り替え">
+    <p id="booking-range" role="status"></p><div>
+    <button id="booking-previous" class="button" type="button">前のページ</button>
+    <span id="booking-page"></span>
+    <button id="booking-next" class="button" type="button">次のページ</button>
+    </div></nav>
               <p class="aside-note">
                 氏名・メールアドレスはこのブラウザのlocalStorageに残ります。共有PCではご注意ください。メールは送信しません。複数PC・利用者間では共有されず、複数タブの完全な同時予約防止は保証できません。
               </p>
@@ -117,7 +133,19 @@
           <p>ローカルデモ・認証なし。このブラウザに保存された全予約を日時順に表示します。</p>
           <p id="admin-storage-error" class="error-message" role="alert"></p>
           <p id="admin-reservation-count" class="description"></p>
-          <div id="admin-reservation-list"></div>
+          <div class="list-controls">
+    <label for="admin-status">状態</label><select id="admin-status"><option value="all">すべて</option><option value="confirmed">確定</option><option value="cancelled">キャンセル済み</option></select>
+    <label for="admin-search">氏名・メールアドレス検索</label>
+    <input id="admin-search" type="search" placeholder="氏名またはメールの一部">
+    <label for="admin-date">予約日（日本時間・履歴は元の予約日）</label>
+    <input id="admin-date" type="date">
+    <button id="admin-clear-date" class="button" type="button">日付をクリア</button>
+    </div><div id="admin-reservation-list"></div><nav class="pagination" aria-label="管理者のページ切り替え">
+    <p id="admin-range" role="status"></p><div>
+    <button id="admin-previous" class="button" type="button">前のページ</button>
+    <span id="admin-page"></span>
+    <button id="admin-next" class="button" type="button">次のページ</button>
+    </div></nav>
           <a class="button" href="#booking">← 予約受付画面へ戻る</a>
         </section>
       </main>
