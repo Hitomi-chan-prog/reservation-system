@@ -49,16 +49,35 @@ window.Reservations = (() => {
     }
     fail('予約IDを生成できませんでした。もう一度お試しください。');
   }
+  function checkDestination({ start, end, icsReady, events }, current) {
+    if (!icsReady) fail('予約確定にはICSファイルの読み込みが必要です。');
+    if (!validRange(start, end)) fail('予約は月〜金9:00〜18:00の30分枠を選択してください。');
+    if (start <= Date.now()) fail('過去または開始済みの日時は予約できません。');
+    if (events.some(event => event.status !== 'CANCELLED' && Calendar.overlaps(event, { start, end })) ||
+        current.some(item => item.status === 'confirmed' && Calendar.overlaps(item, { start, end }))) {
+      fail('この枠にはICS予定または予約があるため登録できません。');
+    }
+  }
+  const unchanged = (item, snapshot) => Boolean(item && snapshot &&
+    ['id', 'name', 'email', 'start', 'end', 'status', 'createdAt', 'cancelledAt'].every(key => item[key] === snapshot[key]));
+  function reschedule({ snapshot, start, end, icsReady, events }) {
+    const current = BookingStorage.read();
+    const target = current.find(item => snapshot && item.id === snapshot.id);
+    if (!target || target.status !== 'confirmed') fail('この予約は存在しないか、キャンセル済みのため変更できません。');
+    if (!unchanged(target, snapshot)) fail('別タブなどで予約が変更されています。日時変更を中止して一覧からやり直してください。');
+    if (target.start === start && target.end === end) fail('同じ日時への変更は不要です。別の枠を選択してください。');
+    checkDestination({ start, end, icsReady, events }, current.filter(item => item.id !== target.id));
+    const next = current.map(item => item.id === target.id ? { ...item, start, end } : item);
+    BookingStorage.write(next);
+    return next;
+  }
   function register({ name, email, start, end, icsReady, events }) {
     const normalized = input(name, email);
     if (!icsReady) fail('予約確定にはICSファイルの読み込みが必要です。');
     if (!validRange(start, end)) fail('予約は月〜金9:00〜18:00の30分枠を選択してください。');
     if (start <= Date.now()) fail('過去または開始済みの日時は予約できません。');
     const current = BookingStorage.read();
-    const localDate = new Date(start + 540 * 60000);
-    const date = new Date(Date.UTC(localDate.getUTCFullYear(), localDate.getUTCMonth(), localDate.getUTCDate()));
-    const slot = (localDate.getUTCHours() - 9) * 2 + localDate.getUTCMinutes() / 30;
-    if (Calendar.availability(date, slot, events, current).state !== 'available') fail('この枠にはICS予定または予約があるため登録できません。');
+    checkDestination({ start, end, icsReady, events }, current);
     const now = Date.now();
     if (start <= now) fail('開始済みの日時は予約できません。別の枠を選択してください。');
     const reservation = { id: uniqueId(current), ...normalized, start, end, status: 'confirmed', createdAt: now, cancelledAt: null };
@@ -74,5 +93,5 @@ window.Reservations = (() => {
     BookingStorage.write(next);
     return next;
   }
-  return { input, validRange, validateData, register, cancel };
+  return { input, validRange, validateData, register, cancel, reschedule, unchanged };
 })();

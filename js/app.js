@@ -8,6 +8,7 @@ let importedEvents = new Map();
 let importedFiles = new Map();
 let importGeneration = 0;
 let importQueue = Promise.resolve();
+const activeReads = new Set();
 const dateAt = (day) => new Date(displayedMonday.getTime() + day * 86400000);
 const shortDate = (date) => `${date.getUTCMonth() + 1}/${date.getUTCDate()}`;
 const timeAt = (slot) => `${String(9 + Math.floor(slot / 2)).padStart(2, "0")}:${slot % 2 ? "30" : "00"}`;
@@ -16,10 +17,13 @@ let reservations = [];
 let selectedRange = null;
 let cancelId = null;
 let pendingImports = 0;
+let importFailed = false;
+let rescheduleSnapshot = null;
+let rescheduleRange = null;
 const tokyoDate = (timestamp) => new Intl.DateTimeFormat('ja-JP', { timeZone: 'Asia/Tokyo', year: 'numeric', month: '2-digit', day: '2-digit', weekday: 'short' }).format(timestamp);
 const tokyoTime = (timestamp) => new Intl.DateTimeFormat('ja-JP', { timeZone: 'Asia/Tokyo', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(timestamp);
 const bookingLabel = (item) => `${tokyoDate(item.start)} ${tokyoTime(item.start)}–${tokyoTime(item.end)}`;
-const icsReady = () => importedFiles.size > 0 && pendingImports === 0;
+const icsReady = () => importedFiles.size > 0 && pendingImports === 0 && !importFailed;
 
 function createTextElement(tag, text, className) {
   const element = document.createElement(tag);
@@ -29,6 +33,15 @@ function createTextElement(tag, text, className) {
 }
 
 function openReservationDialog(date, slot) {
+  if (rescheduleSnapshot) {
+    rescheduleRange = Calendar.slotRange(date, slot);
+    byId('reschedule-before').textContent = `${bookingLabel(rescheduleSnapshot)} / ${rescheduleSnapshot.name} / ${rescheduleSnapshot.email}`;
+    byId('reschedule-after').textContent = bookingLabel(rescheduleRange);
+    byId('reschedule-error').textContent = '';
+    updateBookingHint();
+    byId('reschedule-dialog').showModal();
+    return;
+  }
   selectedRange = Calendar.slotRange(date, slot);
   byId("reservation-dialog").querySelector("form").reset();
   byId("booking-error").textContent = "";
@@ -61,7 +74,7 @@ function renderCalendar() {
     row.append(label);
     weekdays.forEach((weekday, day) => {
       const date = dateAt(day);
-      const result = Calendar.availability(date, slot, [...importedEvents.values()], reservations);
+      const result = Calendar.availability(date, slot, [...importedEvents.values()], reservations.filter(item => !rescheduleSnapshot || item.id !== rescheduleSnapshot.id));
       const reservation = result.reservation;
       const cell = document.createElement("td");
       if (reservation) {
@@ -77,7 +90,12 @@ function renderCalendar() {
       } else {
         const button = createTextElement("button", "");
         button.type = "button";
-        button.setAttribute("aria-label", `${shortDate(date)}（${weekday}）${timeAt(slot)}–${timeAt(slot + 1)} 空き・予約入力を開く`);
+        if (rescheduleSnapshot) {
+          const range = Calendar.slotRange(date, slot);
+          button.disabled = range.start <= Date.now();
+          if (range.start === rescheduleSnapshot.start) button.textContent = '現在の予約';
+        }
+        button.setAttribute("aria-label", `${shortDate(date)}（${weekday}）${timeAt(slot)}–${timeAt(slot + 1)} 空き・${rescheduleSnapshot ? "変更先を選択" : "予約入力を開く"}`);
         button.addEventListener("click", () => openReservationDialog(date, slot));
         cell.append(button);
       }
@@ -123,7 +141,11 @@ function renderReservations() {
           byId('cancel-error').textContent = '';
           byId('cancel-dialog').showModal();
         });
-        actions.append(cancel);
+        const change = createTextElement('button', '日時変更', 'button reschedule-button');
+        change.type = 'button';
+        change.dataset.reservationId = reservation.id;
+        change.addEventListener('click', () => startReschedule(reservation.id));
+        actions.append(change, cancel);
         card.append(actions);
       }
       if (reservation.status === 'cancelled') {
@@ -185,10 +207,84 @@ for (const status of ['confirmed', 'cancelled']) {
     byId(`${next}-tab`).focus();
   });
 }
-function updateBookingHint() {
-  byId('confirm-booking').disabled = !icsReady();
-  byId('booking-hint').textContent = icsReady() ? '選択日時と入力内容を確認して予約を確定してください。' : 'ICSファイルを読み込み、完了するまで予約を確定できません。';
+function icsMessage() {
+  if (pendingImports > 0) return '読み込み中：予定を確認しています。完了するまで確定できません。';
+  if (importFailed) return 'エラー：予定を確認できませんでした。ICSファイルを再読み込みしてください。確定できません。';
+  if (!importedFiles.size) return '未読み込み：予約するにはICSファイルを読み込んでください。確定できません。';
+  return '読み込み成功：予定の読み込みが完了しました。選択日時と入力内容を確認してください。';
 }
+function rescheduleProblem() {
+  if (!rescheduleSnapshot) return '';
+  const current = reservations.find(item => item.id === rescheduleSnapshot.id);
+  if (!current || current.status !== 'confirmed' || !Reservations.unchanged(current, rescheduleSnapshot)) {
+    return '別タブなどで予約が変更・キャンセルされています。日時変更を中止して一覧からやり直してください。';
+  }
+  if (rescheduleRange && rescheduleRange.start === rescheduleSnapshot.start) return '同じ日時への変更は不要です。別の枠を選択してください。';
+  return '';
+}
+function updateBookingHint() {
+  const message = icsMessage();
+  byId('ics-state').textContent = message;
+  byId('confirm-booking').disabled = !icsReady();
+  byId('booking-hint').textContent = message;
+  const problem = rescheduleProblem();
+  byId('confirm-reschedule').disabled = !icsReady() || !rescheduleRange || Boolean(problem);
+  byId('reschedule-hint').textContent = [message, problem].filter(Boolean).join(' ');
+  byId('reschedule-mode-error').textContent = problem;
+}
+function startReschedule(id) {
+  try {
+    const current = BookingStorage.read();
+    const target = current.find(item => item.id === id && item.status === 'confirmed');
+    if (!target) throw new Error('変更できる確定予約がありません。');
+    reservations = current;
+    rescheduleSnapshot = { ...target };
+    rescheduleRange = null;
+    const local = new Date(target.start + 9 * 3600000);
+    displayedMonday = startOfWeek(new Date(Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate())));
+    byId('reschedule-current').textContent = `${bookingLabel(target)} / ${target.name} / ${target.email}`;
+    byId('reschedule-mode').hidden = false;
+    showStorageError('');
+    renderAll();
+    byId('reschedule-mode').scrollIntoView({ block: 'center' });
+    byId('stop-reschedule').focus();
+  } catch (error) { showStorageError(error.message); }
+}
+function stopReschedule() {
+  const id = rescheduleSnapshot && rescheduleSnapshot.id;
+  rescheduleSnapshot = null;
+  rescheduleRange = null;
+  byId('reschedule-mode').hidden = true;
+  renderAll();
+  const button = [...document.querySelectorAll('#reservation-list .reschedule-button')]
+    .find(element => element.dataset.reservationId === id && element.getClientRects().length);
+  const fallback = byId(byId('booking-view').hidden ? 'admin-heading' : 'reservations-heading');
+  (button || fallback).focus();
+}
+byId('stop-reschedule').addEventListener('click', stopReschedule);
+function dismissReschedule() {
+  byId('reschedule-dialog').close();
+  stopReschedule();
+}
+byId('dismiss-reschedule').addEventListener('click', dismissReschedule);
+byId('reschedule-dialog').addEventListener('cancel', event => {
+  event.preventDefault();
+  dismissReschedule();
+});
+byId('confirm-reschedule').addEventListener('click', () => {
+  byId('operation-status').textContent = '';
+  try {
+    reservations = Reservations.reschedule({ snapshot: rescheduleSnapshot, ...rescheduleRange,
+      icsReady: icsReady(), events: [...importedEvents.values()] });
+    byId('reschedule-dialog').close();
+    showStorageError('');
+    stopReschedule();
+    byId('operation-status').textContent = '予約日時を変更し、保存しました。';
+  } catch (error) {
+    byId('reschedule-error').textContent = error.message;
+    reloadReservations();
+  }
+});
 function renderAll() {
   renderCalendar();
   renderReservations();
@@ -215,24 +311,45 @@ function importSummary() {
     ? `読み込み済み：${[...importedFiles].map(([name, count]) => `${name}（${count}件）`).join("、")} · UID重複除去後 ${importedEvents.size}件（キャンセル ${[...importedEvents.values()].filter((e) => e.status === "CANCELLED").length}件）`
     : "未読み込み · ICSを読み込むまで新規予約は確定できません。";
 }
+function readICSFile(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    let settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      activeReads.delete(task);
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const task = { cancel() {
+      try { if (typeof reader.abort === 'function') reader.abort(); }
+      catch { /* 中止通知が失敗しても世代を破棄し、待機は解除する。 */ }
+      finally { finish(new Error('読み込みを中止しました。')); }
+    } };
+    activeReads.add(task);
+    reader.onload = () => { if (!settled) finish(null, reader.result); };
+    reader.onerror = reader.onabort = () => finish(new Error('ファイルを読み込めませんでした。'));
+    try { reader.readAsText(file, 'UTF-8'); }
+    catch (error) { finish(error); }
+  });
+}
 function showSelectedFiles(files) {
   const selected = Array.from(files);
   const generation = importGeneration;
   if (!selected.length) return;
+  if (pendingImports === 0) importFailed = false;
   pendingImports += 1;
   updateBookingHint();
   importQueue = importQueue.then(async () => {
     if (generation !== importGeneration) return;
     const errors = [];
     for (const file of selected) {
+      if (generation !== importGeneration) return;
       try {
         if (!/\.ics$/i.test(file.name)) throw new Error(".ics ファイルを選択してください。");
-        const source = await new Promise((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = () => resolve(reader.result);
-          reader.onerror = reader.onabort = () => reject(new Error("ファイルを読み込めませんでした。"));
-          reader.readAsText(file, "UTF-8");
-        });
+        const source = await readICSFile(file);
+        if (generation !== importGeneration) return;
         const events = ICSParser.parse(source);
         if (generation !== importGeneration) return;
         events.forEach((event) => importedEvents.set(event.uid, event));
@@ -242,12 +359,15 @@ function showSelectedFiles(files) {
       }
     }
     if (generation !== importGeneration) return;
+    if (errors.length) importFailed = true;
     byId("import-status").textContent = importSummary();
     byId("import-error").textContent = errors.length ? `読み込みエラー（失敗したファイルは取り込んでいません）：${errors.join(" / ")}` : "";
     renderAll();
   }).finally(() => {
-    pendingImports -= 1;
-    updateBookingHint();
+    if (generation === importGeneration) {
+      pendingImports -= 1;
+      updateBookingHint();
+    }
   });
 }
 
@@ -261,6 +381,10 @@ byId("choose-file").addEventListener("click", () => byId("ics-file").click());
 byId("ics-file").addEventListener("change", (event) => { showSelectedFiles(event.target.files); event.target.value = ""; });
 byId("clear-files").addEventListener("click", () => {
   importGeneration += 1;
+  importQueue = Promise.resolve();
+  for (const task of [...activeReads]) task.cancel();
+  pendingImports = 0;
+  importFailed = false;
   importedEvents.clear();
   importedFiles.clear();
   byId("ics-file").value = "";

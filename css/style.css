@@ -772,3 +772,8 @@ td.reserved {
 .pagination .button { padding: 5px; }
 button:disabled { opacity: .5; cursor: default; }
 .list-controls .button { justify-self: start; }
+
+.reschedule-mode { border: 1px solid var(--line); background: #eee7d4; padding: 14px; margin: 15px 0; font-size: 12px; overflow-wrap: anywhere; }
+.reschedule-mode h3 { font-size: 14px; }
+#reschedule-before, #reschedule-after { overflow-wrap: anywhere; }
+.card-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
