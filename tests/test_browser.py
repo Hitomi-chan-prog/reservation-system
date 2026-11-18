@@ -405,19 +405,19 @@ with sync_playwright() as p:
 
     def cancel_booking(target, _):
         book(target)
-        target.locator('#reservation-list button').click()
+        target.locator('#reservation-list .card-actions button:not(.reschedule-button)').click()
         assert target.locator('#cancel-dialog').evaluate('(e) => e.open')
         assert '山田 花子' in target.locator('#cancel-detail').inner_text()
         target.locator('#dismiss-cancel').click()
         assert read_bookings(target)[0]['status'] == 'confirmed'
-        target.locator('#reservation-list button').click()
+        target.locator('#reservation-list .card-actions button:not(.reschedule-button)').click()
         target.locator('#confirm-cancel').click()
         saved = read_bookings(target)[0]
         assert saved['status'] == 'cancelled' and saved['cancelledAt'] is not None
         assert slot(target).locator('button').count() == 1
-        assert target.locator('#reservation-list button').count() == 0
+        assert target.locator('#reservation-list .card-actions button:not(.reschedule-button)').count() == 0
         target.locator('#cancelled-tab').click()
-        assert target.locator('#reservation-list button').count() == 0
+        assert target.locator('#reservation-list .card-actions button:not(.reschedule-button)').count() == 0
         result = target.evaluate('''() => { try { Reservations.cancel(reservations[0].id); return ''; } catch(e) { return e.message; } }''')
         assert 'キャンセル済み' in result
         target.reload()
@@ -432,7 +432,7 @@ with sync_playwright() as p:
         assert '競合' in target.locator('#conflict-warning').inner_text()
         assert read_bookings(target)[0]['status'] == 'confirmed'
         assert slot(target).get_attribute('class') == 'reserved'
-        target.locator('#reservation-list button').click()
+        target.locator('#reservation-list .card-actions button:not(.reschedule-button)').click()
         target.locator('#confirm-cancel').click()
         assert slot(target).get_attribute('class') == 'busy'
     run_booking_test('STEP3 ICS競合警告・予約保護・取消後ICS枠維持', conflict)
@@ -475,7 +475,7 @@ with sync_playwright() as p:
 
     def cancel_failure(target, _):
         book(target)
-        target.locator('#reservation-list button').click()
+        target.locator('#reservation-list .card-actions button:not(.reschedule-button)').click()
         target.evaluate('''() => { Storage.prototype.setItem = function() { throw new Error('denied'); }; }''')
         target.locator('#confirm-cancel').click()
         assert '保存できません' in target.locator('#cancel-error').inner_text()
@@ -491,7 +491,7 @@ with sync_playwright() as p:
         other.wait_for_function('reservations.length === 1')
         assert other.locator('td.reserved').count() == 1
         assert '山田 花子' in other.locator('#admin-reservation-list').inner_text()
-        other.locator('#reservation-list button').click()
+        other.locator('#reservation-list .card-actions button:not(.reschedule-button)').click()
         other.locator('#confirm-cancel').click()
         target.wait_for_function('reservations[0].status === "cancelled"')
         assert target.locator('td.reserved').count() == 0
@@ -715,7 +715,7 @@ with sync_playwright() as p:
         assert not target.locator('#reservation-dialog').evaluate('(e) => e.open')
         for width in [390, 1440]:
             target.set_viewport_size({'width': width, 'height': 900})
-            target.locator('#reservation-list button').click()
+            target.locator('#reservation-list .card-actions button:not(.reschedule-button)').click()
             dialog = target.locator('#cancel-dialog')
             assert dialog.evaluate('(e) => e.open')
             detail = target.locator('#cancel-detail')
@@ -737,7 +737,7 @@ with sync_playwright() as p:
             assert not dialog.evaluate('(e) => e.open')
             assert read_bookings(target) == before
             assert before[0]['status'] == 'confirmed'
-        target.locator('#reservation-list button').click()
+        target.locator('#reservation-list .card-actions button:not(.reschedule-button)').click()
         target.locator('#confirm-cancel').click()
         assert not target.locator('#cancel-dialog').evaluate('(e) => e.open')
         saved = read_bookings(target)[0]
@@ -776,7 +776,7 @@ with sync_playwright() as p:
         assert '履歴の人' not in target.locator('#reservation-list').inner_text()
         target.locator('#cancelled-tab').click()
         assert target.locator('#reservation-list .reservation-card').count() == 1
-        assert target.locator('#reservation-list button').count() == 0
+        assert target.locator('#reservation-list .card-actions button:not(.reschedule-button)').count() == 0
         assert '2026/06/29' in target.locator('#reservation-list').inner_text()
         assert '09:00（日本時間）' in target.locator('#reservation-list').inner_text()
         target.locator('#cancelled-tab').press('ArrowLeft')
@@ -932,7 +932,7 @@ with sync_playwright() as p:
     def update(target, _):
         seed(target, 21)
         target.locator('#booking-next').click()
-        target.locator('#reservation-list button').click()
+        target.locator('#reservation-list .card-actions button:not(.reschedule-button)').click()
         target.locator('#confirm-cancel').click()
         assert target.locator('#booking-page').inner_text() == '1 / 1ページ'
         assert target.locator('#confirmed-tab').inner_text() == '確定予約（20件）'
@@ -1004,6 +1004,484 @@ with sync_playwright() as p:
         target.locator('#booking-search').fill(payload)
         assert '全1件中' in target.locator('#booking-range').inner_text()
     run_booking_test('STEP4 長い氏名/メール・XSS・1440px/390px・両画面横幅', layouts)
+
+
+    # STEP 5: 登録ボタンの状態と日時変更。待機は読み込み・DOM・storage反映で同期する。
+    def start_change(target, index=4):
+        target.locator('#reservation-list .reschedule-button').first.click()
+        assert target.locator('#reschedule-mode').is_visible()
+        slot(target, index).locator('button').click()
+        assert target.locator('#reschedule-dialog').evaluate('(e) => e.open')
+
+    def rejected_change(target, **values):
+        result = target.evaluate("""values => {
+          try {
+            Reservations.reschedule({snapshot: reservations[0], ...Calendar.slotRange(displayedMonday, 4), icsReady: true, events: [], ...values});
+            return '';
+          } catch (error) { return error.message; }
+        }""", values)
+        assert result, values
+        return result
+
+    def ics_states(target, _):
+        open_booking(target)
+        assert target.locator('#confirm-booking').is_disabled()
+        assert '未読み込み' in target.locator('#booking-hint').inner_text()
+        target.locator('#dismiss-booking').click()
+        load_ics(target, 'bad ICS', 'bad.ics')
+        open_booking(target)
+        assert target.locator('#confirm-booking').is_disabled()
+        assert 'エラー' in target.locator('#booking-hint').inner_text()
+        assert '予定を確認できませんでした' in target.locator('#ics-state').inner_text()
+        # ダイアログが開いた状態でも非同期状態の変更が反映される。
+        target.evaluate(r"showSelectedFiles([new File(['BEGIN:VCALENDAR\nVERSION:2.0\nEND:VCALENDAR\n'], 'ok.ics')])")
+        target.evaluate('async () => { await importQueue; }')
+        assert target.locator('#confirm-booking').is_enabled()
+        assert '読み込みが完了' in target.locator('#booking-hint').inner_text()
+        target.evaluate("showSelectedFiles([new File(['bad'], 'bad-again.ics')])")
+        target.evaluate('async () => { await importQueue; }')
+        assert target.locator('#confirm-booking').is_disabled()
+        assert target.evaluate('importedFiles.size') == 1
+        target.locator('#dismiss-booking').click()
+        target.locator('#clear-files').click()
+        open_booking(target)
+        assert target.locator('#confirm-booking').is_disabled()
+        assert '未読み込み' in target.locator('#booking-hint').inner_text()
+    run_booking_test('STEP5 ICS未読込・エラー・正常復帰・既存成功後失敗・クリアの案内', ics_states)
+
+    def pending_states(target, _):
+        load_ics(target)
+        open_booking(target)
+        target.evaluate("""() => {
+            window.NativeReader = FileReader;
+            window.FileReader = class {readAsText() { window.step5Reader = this; }};
+            showSelectedFiles([new File(['pending'], 'pending.ics')]);
+        }""")
+        target.wait_for_function('Boolean(window.step5Reader)')
+        assert target.locator('#confirm-booking').is_disabled()
+        assert '読み込み中' in target.locator('#booking-hint').inner_text()
+        target.evaluate(r"""async () => {
+            step5Reader.result = 'BEGIN:VCALENDAR\nVERSION:2.0\nEND:VCALENDAR\n';
+            step5Reader.onload(); await importQueue; window.FileReader = NativeReader;
+        }""")
+        assert target.locator('#confirm-booking').is_enabled()
+        # 開いたダイアログを保持したままクリア（画面ではモーダルのため背後は操作不可）。
+        target.evaluate("document.getElementById('clear-files').click()")
+        assert target.locator('#confirm-booking').is_disabled()
+        assert '未読み込み' in target.locator('#booking-hint').inner_text()
+    run_booking_test('STEP5 ダイアログ中のICS保留・完了・クリアでボタン/理由更新', pending_states)
+
+    for count in [16, 20]:
+        def more_bookings(target, _, count=count):
+            seed(target, count)
+            target.evaluate("""() => {
+                const current = BookingStorage.read().filter(item => item.status === 'confirmed');
+                const history = {...current[0], status: 'cancelled', cancelledAt: Date.now()};
+                BookingStorage.write([...current, ...Array.from({length: 7}, (_, i) => ({...history, id: `cancel-${i}`}))]);
+                reloadReservations();
+            }""")
+            load_ics(target)
+            # 既存予約がない火曜17:30を画面で選択する。
+            target.locator('#calendar-body tr').nth(17).locator('td').nth(1).locator('button').click()
+            target.locator('#customer-name').fill('追加の予約')
+            target.locator('#customer-email').fill('new@example.com')
+            assert target.locator('#confirm-booking').is_enabled()
+            target.locator('#confirm-booking').click()
+            data = read_bookings(target)
+            assert len([item for item in data if item['status'] == 'confirmed']) == count + 1
+            assert len([item for item in data if item['status'] == 'cancelled']) == 7
+            assert not target.locator('#reservation-dialog').evaluate('(e) => e.open')
+        run_booking_test(f'STEP5 キャンセル7件を保持し確定{count+1}件目を登録', more_bookings)
+
+    def changed(target, _):
+        book(target)
+        before = read_bookings(target)[0]
+        start_change(target)
+        assert '10:00' in target.locator('#reschedule-before').inner_text()
+        assert '11:00' in target.locator('#reschedule-after').inner_text()
+        assert target.locator('#confirm-reschedule').is_enabled()
+        target.locator('#confirm-reschedule').click()
+        after = read_bookings(target)[0]
+        assert after['start'] - before['start'] == 3600000
+        assert after['end'] - after['start'] == 1800000
+        for key in ['id', 'name', 'email', 'createdAt', 'status', 'cancelledAt']:
+            assert after[key] == before[key]
+        assert slot(target, 2).locator('button').count() == 1
+        assert slot(target, 4).get_attribute('class') == 'reserved'
+        assert '11:00' in target.locator('#reservation-list strong').inner_text()
+        assert '11:00' in target.locator('#admin-reservation-list strong').inner_text()
+        assert '変更し、保存しました' in target.locator('#operation-status').inner_text()
+        target.reload()
+        assert read_bookings(target)[0] == after
+        assert slot(target, 4).get_attribute('class') == 'reserved'
+    run_booking_test('STEP5 日時変更・ID/個人情報維持・新旧枠・管理者・再読込復元', changed)
+
+    def same_slot(target, _):
+        book(target)
+        start_change(target, 2)
+        assert target.locator('#confirm-reschedule').is_disabled()
+        assert '同じ日時' in target.locator('#reschedule-hint').inner_text()
+        item = read_bookings(target)[0]
+        assert '同じ日時' in rejected_change(target, start=item['start'], end=item['end'])
+        target.locator('#dismiss-reschedule').click()
+        assert target.locator('#reschedule-mode').is_hidden()
+    run_booking_test('STEP5 自身を除外・同じ日時は不要・中止で元予約保持', same_slot)
+
+    for case in ['ICS', 'other', 'past', 'invalid', 'cancelled', 'unloaded']:
+        def reject_destination(target, _, case=case):
+            book(target)
+            raw = target.evaluate('localStorage.getItem(BookingStorage.key)')
+            values = {}
+            if case == 'ICS':
+                values['events'] = [{'start': 1782698400000, 'end': 1782700200000, 'status': 'CONFIRMED'}] # 6/29 11:00 JST
+            elif case == 'other':
+                target.evaluate("""() => {
+                    BookingStorage.write([...reservations, {...reservations[0], id: 'other', ...Calendar.slotRange(displayedMonday, 4)}]); reloadReservations();
+                }""")
+                raw = target.evaluate('localStorage.getItem(BookingStorage.key)')
+            elif case == 'past':
+                values.update(start=1782432000000, end=1782433800000) # 6/26 09:00 JST
+            elif case == 'invalid':
+                values.update(start=1782698400001, end=1782700200001)
+            elif case == 'cancelled':
+                target.evaluate('reservations = Reservations.cancel(reservations[0].id); renderAll()')
+                raw = target.evaluate('localStorage.getItem(BookingStorage.key)')
+                assert target.locator('#reservation-list .reschedule-button').count() == 0
+            else:
+                values['icsReady'] = False
+            rejected_change(target, **values)
+            assert target.evaluate('localStorage.getItem(BookingStorage.key)') == raw
+            if case == 'other':
+                target.locator('#reservation-list .reschedule-button').first.click()
+                assert slot(target, 4).locator('button').count() == 0
+        run_booking_test(f'STEP5 変更拒否・保存不変 {case}', reject_destination)
+
+    def save_failure(target, _):
+        book(target)
+        original = read_bookings(target)
+        start_change(target)
+        target.evaluate("() => { Storage.prototype.setItem = () => { throw Error('quota'); }; }")
+        target.locator('#confirm-reschedule').click()
+        assert '保存できません' in target.locator('#reschedule-error').inner_text()
+        assert read_bookings(target) == original
+        assert not target.locator('#operation-status').inner_text()
+        assert target.locator('#reschedule-dialog').evaluate('(e) => e.open')
+    run_booking_test('STEP5 変更の保存失敗時に元データ保護・成功表示なし', save_failure)
+
+    for operation in ['change', 'cancel']:
+        def stale(target, context, operation=operation):
+            book(target)
+            start_change(target)
+            other = context.new_page()
+            freeze(other)
+            other.goto(url)
+            other.evaluate("""operation => {
+                if (operation === 'cancel') Reservations.cancel(reservations[0].id);
+                else Reservations.reschedule({snapshot: reservations[0], ...Calendar.slotRange(displayedMonday, 6), icsReady: true, events: []});
+            }""", operation)
+            target.wait_for_function('!Reservations.unchanged(reservations[0], rescheduleSnapshot)')
+            assert target.locator('#confirm-reschedule').is_disabled()
+            assert '別タブ' in target.locator('#reschedule-hint').inner_text()
+            raw = other.evaluate('localStorage.getItem(BookingStorage.key)')
+            # disabled制御を迂回しても保存前の再読込で古い上書きを拒否。
+            message = target.evaluate("""() => { try {
+                Reservations.reschedule({snapshot: rescheduleSnapshot, ...rescheduleRange, icsReady:true, events:[]}); return '';
+            } catch(e) {return e.message;} }""")
+            assert message
+            assert target.evaluate('localStorage.getItem(BookingStorage.key)') == raw
+        run_booking_test(f'STEP5 別タブ{operation}検出・古いsnapshotの上書き拒否', stale)
+
+    def recheck(target, _):
+        book(target)
+        start_change(target)
+        target.evaluate("""() => importedEvents.set('late', {...rescheduleRange, uid:'late', status:'CONFIRMED', summary:'後から予定'})""")
+        target.locator('#confirm-reschedule').click()
+        assert 'ICS予定' in target.locator('#reschedule-error').inner_text()
+        assert '10:00' in target.locator('#reservation-list').inner_text()
+        target.evaluate('importedEvents.clear()')
+        target.clock.run_for(7200000)
+        target.locator('#confirm-reschedule').click()
+        assert '過去' in target.locator('#reschedule-error').inner_text()
+    run_booking_test('STEP5 変更確定直前のICSと時刻の再判定', recheck)
+
+    def list_update(target, _):
+        seed(target, 21)
+        load_ics(target)
+        target.locator('#booking-date').fill('2026-06-30')
+        target.locator('#booking-search').fill('user20')
+        target.locator('#reservation-list .reschedule-button').click()
+        target.locator('#calendar-body tr').nth(0).locator('td').nth(2).locator('button').click()
+        target.locator('#confirm-reschedule').click()
+        assert '全0件中' in target.locator('#booking-range').inner_text()
+        assert target.locator('#confirmed-tab').inner_text() == '確定予約（21件）'
+        target.locator('#booking-clear-date').click()
+        assert '2026/07/01' in target.locator('#reservation-list').inner_text()
+        assert target.locator('#booking-page').inner_text() == '1 / 1ページ'
+        target.locator('#booking-search').fill('')
+        target.locator('#booking-next').click()
+        assert '利用者20' in target.locator('#reservation-list').inner_text()
+    run_booking_test('STEP5 日時変更後の検索・件数・表示順・ページへの反映', list_update)
+
+    def change_layout(target, _):
+        book(target)
+        name = '<img src=x onerror=window.step5XSS=true>' + 'A' * 55
+        email = 'a' * 64 + '@' + 'b' * 63 + '.' + 'c' * 63 + '.' + 'd' * 60
+        target.evaluate("""values => { reservations[0].name=values[0]; reservations[0].email=values[1]; BookingStorage.write(reservations); renderAll(); }""", [name, email])
+        for width in [1440, 390]:
+            target.set_viewport_size({'width':width, 'height':1000})
+            start_change(target)
+            assert name in target.locator('#reschedule-before').inner_text()
+            assert email in target.locator('#reschedule-before').inner_text()
+            assert target.locator('#reschedule-dialog img').count() == 0
+            assert target.evaluate('window.step5XSS === undefined')
+            assert target.evaluate('document.documentElement.scrollWidth <= innerWidth')
+            assert target.locator('#reschedule-dialog').evaluate('(e) => e.scrollWidth <= e.clientWidth')
+            assert target.locator('#reschedule-before').evaluate('(e) => e.scrollWidth <= e.clientWidth')
+            if os.environ.get('TEST_ARTIFACT_DIR'):
+                target.screenshot(path=str(Path(os.environ['TEST_ARTIFACT_DIR']) / f'step5-change-{width}.png'))
+            target.locator('#dismiss-reschedule').click()
+            assert target.locator('#reschedule-mode').is_hidden()
+        start_change(target)
+        target.locator('#confirm-reschedule').focus()
+        target.locator('#confirm-reschedule').press('Enter')
+        assert not target.locator('#reschedule-dialog').evaluate('(e) => e.open')
+        assert read_bookings(target)[0]['name'] == name
+    run_booking_test('STEP5 長文・XSS・1440px/390pxの変更画面とキーボード確定', change_layout)
+
+
+    def change_ics_state(target, _):
+        book(target)
+        start_change(target)
+        target.evaluate("showSelectedFiles([new File(['bad'], 'bad.ics')])")
+        target.evaluate('async () => { await importQueue; }')
+        assert target.locator('#confirm-reschedule').is_disabled()
+        assert 'エラー' in target.locator('#reschedule-hint').inner_text()
+        target.evaluate(r"showSelectedFiles([new File(['BEGIN:VCALENDAR\nVERSION:2.0\nEND:VCALENDAR'], 'ok.ics')])")
+        target.evaluate('async () => { await importQueue; }')
+        assert target.locator('#confirm-reschedule').is_enabled()
+        target.evaluate("document.getElementById('clear-files').click()")
+        assert target.locator('#confirm-reschedule').is_disabled()
+        assert '未読み込み' in target.locator('#reschedule-hint').inner_text()
+        assert '10:00' in target.locator('#reservation-list').inner_text()
+    run_booking_test('STEP5 変更確認中のICSエラー・正常復帰・クリア', change_ics_state)
+
+    def clear_pending(target, _):
+        load_ics(target)
+        open_booking(target)
+        target.evaluate("""() => {
+            window.NativeReader = FileReader;
+            window.FileReader = class { readAsText() { window.oldStep5Reader = this; } };
+            showSelectedFiles([new File(['old'], 'old.ics')]);
+        }""")
+        target.wait_for_function('Boolean(window.oldStep5Reader)')
+        target.evaluate("""() => {
+            document.getElementById('clear-files').click();
+            window.FileReader = NativeReader;
+            showSelectedFiles([new File(['bad'], 'new-bad.ics')]);
+        }""")
+        assert target.locator('#confirm-booking').is_disabled()
+        target.evaluate(r"""async () => {
+            oldStep5Reader.result = 'BEGIN:VCALENDAR\nVERSION:2.0\nEND:VCALENDAR';
+            oldStep5Reader.onload(); await importQueue;
+        }""")
+        assert target.evaluate('pendingImports') == 0
+        assert target.evaluate('importedFiles.size') == 0
+        assert target.locator('#confirm-booking').is_disabled()
+        assert 'エラー' in target.locator('#booking-hint').inner_text()
+    run_booking_test('STEP5 読み込み途中クリア・古い完了・後続エラーが状態を壊さない', clear_pending)
+
+    def change_protection(target, _):
+        seed(target, 1)
+        load_ics(target)
+        before = read_bookings(target)
+        start_change(target)
+        target.locator('#confirm-reschedule').click()
+        after = read_bookings(target)
+        assert after[1] == before[1]  # キャンセル履歴は一切変更しない。
+        assert set(after[0]) == set(before[0])
+        assert target.evaluate('JSON.parse(localStorage.getItem(BookingStorage.key)).version') == 1
+        assert len(after) == len(before)
+    run_booking_test('STEP5 STEP3/4形式・監査フィールド追加なし・キャンセル履歴保持', change_protection)
+
+    def late_booking(target, _):
+        book(target)
+        start_change(target)
+        target.evaluate("""() => {
+            BookingStorage.write([...reservations, {...reservations[0], id:'late-booking', ...rescheduleRange}]);
+        }""")
+        raw = target.evaluate('localStorage.getItem(BookingStorage.key)')
+        target.locator('#confirm-reschedule').click()
+        assert '予約がある' in target.locator('#reschedule-error').inner_text()
+        assert target.evaluate('localStorage.getItem(BookingStorage.key)') == raw
+    run_booking_test('STEP5 変更確定直前の他予約を再読込して拒否', late_booking)
+
+    def corrupt_change(target, _):
+        book(target)
+        start_change(target)
+        target.evaluate("localStorage.setItem(BookingStorage.key, 'invalid')")
+        target.locator('#confirm-reschedule').click()
+        assert '不正' in target.locator('#reschedule-error').inner_text()
+        assert target.evaluate('localStorage.getItem(BookingStorage.key)') == 'invalid'
+        assert not target.locator('#operation-status').inner_text()
+    run_booking_test('STEP5 変更時の不正保存データを上書きしない', corrupt_change)
+
+    def blocked_calendar(target, _):
+        book(target)
+        load_ics(target, event('blocked-change', start='20260629T110000', end='20260629T113000'))
+        target.locator('#reservation-list .reschedule-button').click()
+        assert slot(target, 4).get_attribute('class') == 'busy'
+        assert slot(target, 4).locator('button').count() == 0
+        # 日付を過去へ移して変更モードでは空き枠ボタンも無効。
+        target.locator('#previous-week').click()
+        assert target.locator('#calendar-body td button:enabled').count() == 0
+        target.locator('#stop-reschedule').click()
+        assert read_bookings(target)[0]['status'] == 'confirmed'
+    run_booking_test('STEP5 変更カレンダーのICS枠・過去枠は選択不可', blocked_calendar)
+
+
+    # STEP 5レビュー修正: 再描画後のフォーカスと読み込み世代の独立性。
+    def assert_focus(target, selector):
+        assert target.locator(selector).evaluate('(e) => e === document.activeElement && e.getClientRects().length > 0')
+
+    for action in ['stop', 'dismiss', 'escape', 'success']:
+        def restored_focus(target, _, action=action):
+            book(target)
+            raw = target.evaluate('localStorage.getItem(BookingStorage.key)')
+            identity = read_bookings(target)[0]['id']
+            if action == 'stop':
+                target.locator('#reservation-list .reschedule-button').press('Enter')
+                target.locator('#stop-reschedule').press('Enter')
+            else:
+                start_change(target)
+                if action == 'escape':
+                    target.locator('#reschedule-dialog').press('Escape')
+                else:
+                    target.locator('#confirm-reschedule' if action == 'success' else '#dismiss-reschedule').press('Enter')
+            assert target.locator('#reschedule-mode').is_hidden()
+            assert not target.locator('#reschedule-dialog').evaluate('(e) => e.open')
+            assert_focus(target, '#reservation-list .reschedule-button')
+            assert target.locator('#reservation-list .reschedule-button').get_attribute('data-reservation-id') == identity
+            if action != 'success':
+                assert target.evaluate('localStorage.getItem(BookingStorage.key)') == raw
+            target.locator('#reservation-list .reschedule-button').press('Tab')
+            assert_focus(target, '#reservation-list .card-actions button:not(.reschedule-button)')
+        run_booking_test(f'STEP5修正 キーボード{action}後に対象カードへフォーカス復元', restored_focus)
+
+    def filtered_focus(target, _):
+        book(target)
+        target.locator('#booking-date').fill('2026-06-29')
+        target.locator('#reservation-list .reschedule-button').press('Enter')
+        target.locator('#calendar-body tr').nth(4).locator('td').nth(1).locator('button').click()
+        target.locator('#confirm-reschedule').press('Enter')
+        assert target.locator('#reservation-list .reschedule-button').count() == 0
+        assert '全0件中' in target.locator('#booking-range').inner_text()
+        assert_focus(target, '#reservations-heading')
+        target.locator('#reservations-heading').press('Tab')
+        assert_focus(target, '#confirmed-tab')
+    run_booking_test('STEP5修正 変更後に日付検索から消えたら一覧見出しへフォーカス', filtered_focus)
+
+    def page_focus(target, _):
+        seed(target, 21)
+        target.evaluate("""() => {
+            const items = BookingStorage.read();
+            Object.assign(items[16], Calendar.slotRange(new Date(Date.UTC(2026, 6, 1)), 0));
+            BookingStorage.write(items); reloadReservations();
+        }""")
+        load_ics(target)
+        target.locator('#booking-next').click()
+        target.locator('#reservation-list .reschedule-button').press('Enter')
+        target.locator('#calendar-body tr').nth(16).locator('td').nth(0).locator('button').click()
+        target.locator('#confirm-reschedule').press('Enter')
+        # 最終ページの予約を空けておいた早い日時へ移す。非表示カードを追わない。
+        assert target.locator('#booking-page').inner_text() == '2 / 2ページ'
+        assert_focus(target, '#reservations-heading')
+    run_booking_test('STEP5修正 並び替えで別ページへ移ったカードのフォーカス代替', page_focus)
+
+    for delayed in ['load', 'error']:
+        def clear_independent(target, _, delayed=delayed):
+            load_ics(target)
+            open_booking(target)
+            raw = target.evaluate('localStorage.getItem(BookingStorage.key)')
+            target.evaluate("""() => {
+                window.NativeReader = FileReader;
+                window.readTasks = [];
+                window.FileReader = class {
+                    readAsText(file) {this.file = file; readTasks.push(this);}
+                    abort() {this.aborted = true; this.onabort();}
+                };
+                showSelectedFiles([new File(['old'], 'old.ics'), new File(['skip'], 'skip.ics')]);
+                window.oldQueue = importQueue;
+            }""")
+            target.wait_for_function('readTasks.length === 1')
+            assert target.locator('#confirm-booking').is_disabled()
+            target.evaluate("""() => {
+                document.getElementById('clear-files').click();
+                showSelectedFiles([new File(['first'], 'first.ics'), new File(['second'], 'second.ics')]);
+            }""")
+            # 古いonload/onerrorを通知する前に、新世代のFileReaderが開始する。
+            target.wait_for_function('readTasks.length === 2')
+            assert target.evaluate('readTasks[0].aborted === true')
+            assert target.evaluate('readTasks.map(task => task.file.name)') == ['old.ics', 'first.ics']
+            assert target.locator('#confirm-booking').is_disabled()
+            target.evaluate("""delayed => {
+                if (delayed === 'load') {readTasks[0].result='invalid stale ICS'; readTasks[0].onload();}
+                else readTasks[0].onerror();
+            }""", delayed)
+            assert target.evaluate('pendingImports') == 1
+            assert target.locator('#confirm-booking').is_disabled()
+            target.evaluate('source => {readTasks[1].result=source; readTasks[1].onload();}', event('same', start='20260701T100000', end='20260701T103000'))
+            target.wait_for_function('readTasks.length === 3')
+            assert target.locator('#confirm-booking').is_disabled()
+            target.evaluate('source => {readTasks[2].result=source; readTasks[2].onload();}', event('same', start='20260701T140000', end='20260701T143000'))
+            target.evaluate('async () => {await importQueue; await oldQueue;}')
+            assert target.evaluate('[...importedFiles.keys()]') == ['first.ics', 'second.ics']
+            assert target.evaluate('importedEvents.size') == 1
+            assert target.evaluate('importedEvents.get("same").start') == int(datetime(2026, 7, 1, 5, tzinfo=timezone.utc).timestamp() * 1000)
+            assert target.locator('#confirm-booking').is_enabled()
+            assert '読み込み成功' in target.locator('#booking-hint').inner_text()
+            before = target.evaluate('JSON.stringify({events:[...importedEvents],files:[...importedFiles],pending:pendingImports})')
+            target.evaluate("""() => {
+                readTasks[0].onerror(); readTasks[0].result='stale'; readTasks[0].onload(); window.FileReader=NativeReader;
+            }""")
+            assert target.evaluate('JSON.stringify({events:[...importedEvents],files:[...importedFiles],pending:pendingImports})') == before
+            assert target.locator('#confirm-booking').is_enabled()
+            assert not target.locator('#import-error').inner_text()
+            assert target.evaluate('activeReads.size') == 0
+            assert target.evaluate('localStorage.getItem(BookingStorage.key)') == raw
+        run_booking_test(f'STEP5修正 クリア直後の独立読込・abort・旧{delayed}・複数ファイル/UID・状態保護', clear_independent)
+
+    def ui_labels(target, _):
+        load_ics(target)
+        open_booking(target)
+        raw = target.evaluate('localStorage.getItem(BookingStorage.key)')
+        assert target.locator('#dismiss-booking').inner_text() == '入力をやめる'
+        assert target.locator('.close-button').get_attribute('aria-label') == '入力をやめる'
+        assert target.locator('#confirm-booking').inner_text() == '予約を確定する'
+        target.locator('#dismiss-booking').press('Enter')
+        assert target.evaluate('localStorage.getItem(BookingStorage.key)') == raw
+        open_booking(target)
+        target.locator('#reservation-dialog').press('Escape')
+        assert target.evaluate('localStorage.getItem(BookingStorage.key)') == raw
+        open_booking(target)
+        target.locator('.close-button').press('Enter')
+        assert target.evaluate('localStorage.getItem(BookingStorage.key)') == raw
+        book(target)
+        raw = target.evaluate('localStorage.getItem(BookingStorage.key)')
+        start_change(target)
+        assert target.locator('#dismiss-reschedule').inner_text() == '変更をやめる'
+        assert target.locator('#stop-reschedule').inner_text() == '変更をやめる'
+        assert target.locator('#confirm-reschedule').inner_text() == '変更を確定する'
+        target.locator('#dismiss-reschedule').press('Enter')
+        assert target.evaluate('localStorage.getItem(BookingStorage.key)') == raw
+        target.locator('#reservation-list .card-actions button:not(.reschedule-button)').press('Enter')
+        assert target.locator('#dismiss-cancel').inner_text() == '戻る'
+        assert target.locator('#confirm-cancel').inner_text() == 'キャンセルを確定する'
+        target.locator('#dismiss-cancel').press('Enter')
+        assert target.evaluate('localStorage.getItem(BookingStorage.key)') == raw
+        target.locator('#reservation-list .card-actions button:not(.reschedule-button)').press('Enter')
+        target.locator('#cancel-dialog').press('Escape')
+        assert target.evaluate('localStorage.getItem(BookingStorage.key)') == raw
+    run_booking_test('STEP5修正 UI文言・×・Escape・中止操作の保存不変', ui_labels)
 
     print(json.dumps({'sample_events': len(events), 'browser_errors': errors, 'passed': len(passed), 'failed': len(failures), 'test_groups': passed, 'failures': failures}, ensure_ascii=False))
     assert not failures, failures

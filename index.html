@@ -44,6 +44,7 @@
             <p id="import-status" role="status">未読み込み · ICSを読み込むまで新規予約は確定できません。</p>
             <button id="clear-files" class="button" type="button">読み込んだ予定をクリア</button>
           </div>
+          <p id="ics-state" class="description" role="status"></p>
           <p id="import-error" class="description" role="alert"></p>
           <p id="storage-error" class="error-message" role="alert"></p>
           <p id="operation-status" class="description" role="status"></p>
@@ -58,8 +59,15 @@
               </h2>
               <p class="description">緑の空き枠をクリックすると、予約入力画面が開きます。</p>
             </div>
-            <span class="demo-label">STEP 4 / LOCAL</span>
+            <span class="demo-label">STEP 5 / LOCAL</span>
           </div>
+          <section id="reschedule-mode" class="reschedule-mode" aria-labelledby="reschedule-mode-heading" hidden>
+            <h3 id="reschedule-mode-heading">日時変更モード：変更先の空き枠を選択してください</h3>
+            <p id="reschedule-current"></p>
+            <p>氏名・メールは変更されません。本人認証はありません。同じ日時への変更は不要です。</p>
+            <p id="reschedule-mode-error" class="error-message" role="alert"></p>
+            <button id="stop-reschedule" class="button" type="button">変更をやめる</button>
+          </section>
           <div class="calendar-toolbar">
             <nav class="week-navigation" aria-label="表示する週">
               <button id="previous-week" class="button arrow" aria-label="前週" type="button">‹</button>
@@ -92,7 +100,7 @@
               <p class="calendar-note">受付時間 9:00–18:00（日本時間）/ 1枠30分 · 予定はICS、予約はこのブラウザの保存データです。未読み込み時の緑枠は予定未確認です。</p>
             </div>
             <aside class="reservations" aria-labelledby="reservations-heading">
-              <h2 id="reservations-heading">
+              <h2 id="reservations-heading" tabindex="-1">
                 <span class="section-number">03</span>
                 予約一覧
                 <span id="reservation-count" class="count"></span>
@@ -125,7 +133,7 @@
       </main>
       <main id="admin-view" hidden>
         <section class="admin-section">
-          <h2>
+          <h2 id="admin-heading" tabindex="-1">
             <span class="section-number">ADMIN</span>
             管理者画面
           </h2>
@@ -158,7 +166,7 @@
       <form id="booking-form" novalidate>
         <div class="dialog-heading">
           <h2 id="dialog-heading">予約内容の確認</h2>
-          <button class="close-button" type="button" aria-label="閉じる">×</button>
+          <button class="close-button" type="button" aria-label="入力をやめる">×</button>
         </div>
         <p id="selected-slot" class="selected-slot"></p>
         <p class="description">氏名・メールアドレスがこのブラウザに保存されます。本人認証・メール送信はありません。</p>
@@ -166,13 +174,25 @@
         <input id="customer-name" name="name" required autocomplete="name" placeholder="例：山田 太郎">
         <label for="customer-email">メールアドレス</label>
         <input id="customer-email" name="email" type="email" required autocomplete="email" placeholder="例：taro@example.com">
-        <p id="booking-hint" class="dialog-note"></p>
+        <p id="booking-hint" class="dialog-note" role="status"></p>
         <p id="booking-error" class="error-message" role="alert"></p>
         <div class="dialog-actions">
-          <button class="button" id="dismiss-booking" type="button">閉じる</button>
-          <button id="confirm-booking" class="button primary" type="submit" disabled>予約を確定する</button>
+          <button class="button" id="dismiss-booking" type="button">入力をやめる</button>
+          <button id="confirm-booking" aria-describedby="booking-hint" class="button primary" type="submit" disabled>予約を確定する</button>
         </div>
       </form>
+    </dialog>
+    <dialog id="reschedule-dialog" aria-labelledby="reschedule-heading">
+      <h2 id="reschedule-heading">予約日時変更の確認</h2>
+      <p>変更前</p><p id="reschedule-before" class="selected-slot"></p>
+      <p>変更後</p><p id="reschedule-after" class="selected-slot"></p>
+      <p class="description">氏名・メール・予約IDは維持します。本人認証はありません。</p>
+      <p id="reschedule-hint" class="dialog-note" role="status"></p>
+      <p id="reschedule-error" class="error-message" role="alert"></p>
+      <div class="dialog-actions">
+        <button id="dismiss-reschedule" class="button" type="button">変更をやめる</button>
+        <button id="confirm-reschedule" aria-describedby="reschedule-hint" class="button primary" type="button" disabled>変更を確定する</button>
+      </div>
     </dialog>
     <dialog id="cancel-dialog" aria-labelledby="cancel-heading">
       <h2 id="cancel-heading">予約キャンセルの確認</h2>
