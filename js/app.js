@@ -18,12 +18,56 @@ let selectedRange = null;
 let cancelId = null;
 let pendingImports = 0;
 let importFailed = false;
+let importErrors = [];
 let rescheduleSnapshot = null;
 let rescheduleRange = null;
 const tokyoDate = (timestamp) => new Intl.DateTimeFormat('ja-JP', { timeZone: 'Asia/Tokyo', year: 'numeric', month: '2-digit', day: '2-digit', weekday: 'short' }).format(timestamp);
 const tokyoTime = (timestamp) => new Intl.DateTimeFormat('ja-JP', { timeZone: 'Asia/Tokyo', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(timestamp);
 const bookingLabel = (item) => `${tokyoDate(item.start)} ${tokyoTime(item.start)}–${tokyoTime(item.end)}`;
-const icsReady = () => importedFiles.size > 0 && pendingImports === 0 && !importFailed;
+let icsRevision = 0;
+let lastConfirmationState = '';
+const icsStatus = () => pendingImports > 0 ? 'loading' : importFailed ? 'error' : importedFiles.size ? 'ready' : 'unloaded';
+// トークンの記録と操作世代はこのクロージャだけが保持する。ICSの取得元は上の状態管理。
+const bookingContext = (() => {
+  const issued = new WeakMap();
+  const sessions = { booking: null, reschedule: null };
+  const dialogFor = prefix => byId(prefix === 'booking' ? 'reservation-dialog' : 'reschedule-dialog');
+  const rangeFor = prefix => prefix === 'booking' ? selectedRange : rescheduleRange;
+  const retry = () => { throw new Error('ICS状態または同意・予約操作が変わりました。確認画面で内容を再確認してください。'); };
+  function issue(prefix) {
+    const session = sessions[prefix];
+    const range = rangeFor(prefix);
+    if (!session || !dialogFor(prefix).open || !range) retry();
+    const token = Object.freeze({});
+    issued.set(token, { prefix, session, agreement: session.agreement, revision: icsRevision,
+      generation: importGeneration, state: icsStatus(), start: range.start, end: range.end });
+    return Object.freeze({ context: token });
+  }
+  issue.begin = prefix => { sessions[prefix] = { agreement: 0 }; };
+  issue.end = prefix => { sessions[prefix] = null; };
+  issue.agreementChanged = prefix => {
+    if (sessions[prefix]) sessions[prefix].agreement += 1;
+  };
+  Reservations.configureContext((token, request) => {
+    const record = token && issued.get(token);
+    const prefix = request.operation;
+    const session = sessions[prefix];
+    const range = rangeFor(prefix);
+    if (!record || record.prefix !== prefix || !session || record.session !== session ||
+        record.agreement !== session.agreement || !dialogFor(prefix).open || !range ||
+        record.revision !== icsRevision || record.generation !== importGeneration || record.state !== icsStatus() ||
+        record.start !== range.start || record.end !== range.end || request.start !== range.start || request.end !== range.end) retry();
+    if (prefix === 'reschedule' && !Reservations.unchanged(request.snapshot, rescheduleSnapshot)) retry();
+    return { icsStatus: icsStatus(), events: [...importedEvents.values()],
+      externalAcknowledged: byId(`${prefix}-external-ack`).checked,
+      consume() {
+        issued.delete(token);
+        if (sessions[prefix] === session) sessions[prefix] = null;
+      }
+    };
+  });
+  return Object.freeze(issue);
+})();
 
 function createTextElement(tag, text, className) {
   const element = document.createElement(tag);
@@ -34,6 +78,8 @@ function createTextElement(tag, text, className) {
 
 function openReservationDialog(date, slot) {
   if (rescheduleSnapshot) {
+    byId('reschedule-external-ack').checked = false;
+    bookingContext.begin('reschedule');
     rescheduleRange = Calendar.slotRange(date, slot);
     byId('reschedule-before').textContent = `${bookingLabel(rescheduleSnapshot)} / ${rescheduleSnapshot.name} / ${rescheduleSnapshot.email}`;
     byId('reschedule-after').textContent = bookingLabel(rescheduleRange);
@@ -44,6 +90,7 @@ function openReservationDialog(date, slot) {
   }
   selectedRange = Calendar.slotRange(date, slot);
   byId("reservation-dialog").querySelector("form").reset();
+  bookingContext.begin('booking');
   byId("booking-error").textContent = "";
   updateBookingHint();
   byId("selected-slot").textContent = `${date.getUTCFullYear()}年${date.getUTCMonth() + 1}月${date.getUTCDate()}日（${weekdays[(date.getUTCDay() + 6) % 7]}） ${timeAt(slot)}–${timeAt(slot + 1)}`;
@@ -209,9 +256,9 @@ for (const status of ['confirmed', 'cancelled']) {
 }
 function icsMessage() {
   if (pendingImports > 0) return '読み込み中：予定を確認しています。完了するまで確定できません。';
-  if (importFailed) return 'エラー：予定を確認できませんでした。ICSファイルを再読み込みしてください。確定できません。';
-  if (!importedFiles.size) return '未読み込み：予約するにはICSファイルを読み込んでください。確定できません。';
-  return '読み込み成功：予定の読み込みが完了しました。選択日時と入力内容を確認してください。';
+  if (importFailed) return 'エラー：予定を確認できませんでした。ICSファイルを再読み込みまたは明示的にクリアしてください。確定できません。';
+  if (!importedFiles.size) return '未読み込み：ICSファイルは未読み込みです。保存済み予約のみを確認しています。外部カレンダーの予定とは重複する可能性があります。';
+  return '読み込み成功：ICSファイルを読み込みました。保存済み予約と読み込んだICS予定を確認しています。予定の最新性は保証されません。';
 }
 function rescheduleProblem() {
   if (!rescheduleSnapshot) return '';
@@ -223,14 +270,33 @@ function rescheduleProblem() {
   return '';
 }
 function updateBookingHint() {
+  const state = icsStatus();
+  const confirmationState = `${icsRevision}:${state}`;
+  if (lastConfirmationState !== confirmationState) {
+    byId('booking-external-ack').checked = false;
+    byId('reschedule-external-ack').checked = false;
+    lastConfirmationState = confirmationState;
+  }
   const message = icsMessage();
   byId('ics-state').textContent = message;
-  byId('confirm-booking').disabled = !icsReady();
-  byId('booking-hint').textContent = message;
+  byId('ics-state').className = state === 'error' ? 'error-message' : state === 'unloaded' ? 'external-warning' : 'description';
   const problem = rescheduleProblem();
-  byId('confirm-reschedule').disabled = !icsReady() || !rescheduleRange || Boolean(problem);
-  byId('reschedule-hint').textContent = [message, problem].filter(Boolean).join(' ');
+  for (const prefix of ['booking', 'reschedule']) {
+    const needsAck = state === 'unloaded';
+    const acknowledged = byId(`${prefix}-external-ack`).checked;
+    byId(`${prefix}-external-warning`).hidden = !needsAck;
+    const confirmationHint = needsAck ? acknowledged ? '外部予定が未確認であることを確認しました。日時と入力内容を確認して確定してください。' : '確定するには、外部予定が未確認であることへの確認チェックが必要です。' : '';
+    byId(`${prefix}-hint`).textContent = [message, confirmationHint, prefix === 'reschedule' ? problem : ''].filter(Boolean).join(' ');
+    byId(`confirm-${prefix}`).disabled = !(['ready', 'unloaded'].includes(state)) || (needsAck && !acknowledged) ||
+      (prefix === 'reschedule' && (!rescheduleRange || Boolean(problem)));
+  }
   byId('reschedule-mode-error').textContent = problem;
+}
+for (const prefix of ['booking', 'reschedule']) {
+  byId(`${prefix}-external-ack`).addEventListener('change', () => {
+    bookingContext.agreementChanged(prefix);
+    updateBookingHint();
+  });
 }
 function startReschedule(id) {
   try {
@@ -251,6 +317,7 @@ function startReschedule(id) {
   } catch (error) { showStorageError(error.message); }
 }
 function stopReschedule() {
+  bookingContext.end('reschedule');
   const id = rescheduleSnapshot && rescheduleSnapshot.id;
   rescheduleSnapshot = null;
   rescheduleRange = null;
@@ -275,7 +342,7 @@ byId('confirm-reschedule').addEventListener('click', () => {
   byId('operation-status').textContent = '';
   try {
     reservations = Reservations.reschedule({ snapshot: rescheduleSnapshot, ...rescheduleRange,
-      icsReady: icsReady(), events: [...importedEvents.values()] });
+      ...bookingContext('reschedule') });
     byId('reschedule-dialog').close();
     showStorageError('');
     stopReschedule();
@@ -309,7 +376,7 @@ function reloadReservations() {
 function importSummary() {
   return importedFiles.size
     ? `読み込み済み：${[...importedFiles].map(([name, count]) => `${name}（${count}件）`).join("、")} · UID重複除去後 ${importedEvents.size}件（キャンセル ${[...importedEvents.values()].filter((e) => e.status === "CANCELLED").length}件）`
-    : "未読み込み · ICSを読み込むまで新規予約は確定できません。";
+    : "未読み込み · ICSは任意です。外部予定は未確認のため、確定時に確認チェックが必要です。";
 }
 function readICSFile(file) {
   return new Promise((resolve, reject) => {
@@ -338,7 +405,12 @@ function showSelectedFiles(files) {
   const selected = Array.from(files);
   const generation = importGeneration;
   if (!selected.length) return;
-  if (pendingImports === 0) importFailed = false;
+  icsRevision += 1;
+  if (pendingImports === 0) {
+    importFailed = false;
+    importErrors = [];
+    byId('import-error').textContent = '';
+  }
   pendingImports += 1;
   updateBookingHint();
   importQueue = importQueue.then(async () => {
@@ -359,9 +431,10 @@ function showSelectedFiles(files) {
       }
     }
     if (generation !== importGeneration) return;
-    if (errors.length) importFailed = true;
+    importErrors.push(...errors);
+    if (importErrors.length) importFailed = true;
     byId("import-status").textContent = importSummary();
-    byId("import-error").textContent = errors.length ? `読み込みエラー（失敗したファイルは取り込んでいません）：${errors.join(" / ")}` : "";
+    byId("import-error").textContent = importErrors.length ? `読み込みエラー（失敗したファイルは取り込んでいません）：${importErrors.join(" / ")}` : "";
     renderAll();
   }).finally(() => {
     if (generation === importGeneration) {
@@ -371,9 +444,16 @@ function showSelectedFiles(files) {
   });
 }
 
-document.querySelector(".close-button").addEventListener("click", () => {
-  byId("reservation-dialog").close();
-});
+function dismissBooking() {
+  byId('reservation-dialog').close();
+  bookingContext.end('booking');
+}
+document.querySelector('.close-button').addEventListener('click', dismissBooking);
+byId('reservation-dialog').addEventListener('cancel', () => bookingContext.end('booking'));
+for (const prefix of ['booking', 'reschedule']) {
+  const dialog = byId(prefix === 'booking' ? 'reservation-dialog' : 'reschedule-dialog');
+  dialog.addEventListener('close', () => { if (!dialog.open) bookingContext.end(prefix); });
+}
 byId("previous-week").addEventListener("click", () => { displayedMonday.setUTCDate(displayedMonday.getUTCDate() - 7); renderCalendar(); });
 byId("next-week").addEventListener("click", () => { displayedMonday.setUTCDate(displayedMonday.getUTCDate() + 7); renderCalendar(); });
 byId("current-week").addEventListener("click", () => { displayedMonday = startOfWeek(Calendar.today()); renderCalendar(); });
@@ -381,10 +461,12 @@ byId("choose-file").addEventListener("click", () => byId("ics-file").click());
 byId("ics-file").addEventListener("change", (event) => { showSelectedFiles(event.target.files); event.target.value = ""; });
 byId("clear-files").addEventListener("click", () => {
   importGeneration += 1;
+  icsRevision += 1;
   importQueue = Promise.resolve();
   for (const task of [...activeReads]) task.cancel();
   pendingImports = 0;
   importFailed = false;
+  importErrors = [];
   importedEvents.clear();
   importedFiles.clear();
   byId("ics-file").value = "";
@@ -412,7 +494,7 @@ byId('booking-form').addEventListener('submit', (event) => {
     if (!selectedRange) throw new Error('予約枠を選択してください。');
     reservations = Reservations.register({
       ...selectedRange, name: byId('customer-name').value, email: byId('customer-email').value,
-      icsReady: icsReady(), events: [...importedEvents.values()]
+      ...bookingContext('booking')
     });
     byId('reservation-dialog').close();
     showStorageError('');
@@ -436,7 +518,7 @@ byId('confirm-cancel').addEventListener('click', () => {
     reloadReservations();
   }
 });
-byId('dismiss-booking').addEventListener('click', () => byId('reservation-dialog').close());
+byId('dismiss-booking').addEventListener('click', dismissBooking);
 byId('dismiss-cancel').addEventListener('click', () => byId('cancel-dialog').close());
 window.addEventListener('storage', (event) => {
   if (event.key === BookingStorage.key || event.key === null) {

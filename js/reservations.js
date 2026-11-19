@@ -49,41 +49,68 @@ window.Reservations = (() => {
     }
     fail('予約IDを生成できませんでした。もう一度お試しください。');
   }
-  function checkDestination({ start, end, icsReady, events }, current) {
-    if (!icsReady) fail('予約確定にはICSファイルの読み込みが必要です。');
+  // 画面起動時に一度だけ接続する。呼び出し元の状態・同意・予定は保存判断に使わない。
+  let contextProvider = null;
+  function configureContext(provider) {
+    if (contextProvider || typeof provider !== 'function') fail('予約確認の取得元は変更できません。');
+    contextProvider = provider;
+  }
+  function resolveContext(context, request) {
+    if (!contextProvider) fail('予約確認を初期化できていません。画面を開き直してください。');
+    return contextProvider(context, request);
+  }
+  function commit(next, current, context, request) {
+    const latest = BookingStorage.read();
+    if (JSON.stringify(latest) !== JSON.stringify(current)) fail('保存直前に予約データが更新されました。内容を再確認してください。');
+    const policy = resolveContext(context, request);
+    checkDestination({ ...request, ...policy }, latest.filter(item => item.id !== request.excludeId));
+    BookingStorage.write(next);
+    policy.consume();
+    return next;
+  }
+  function checkICS(icsStatus, externalAcknowledged) {
+    if (icsStatus === 'ready') return;
+    if (icsStatus === 'loading') fail('ICS読み込み中です。完了するまで確定できません。');
+    if (icsStatus === 'error') fail('ICS読み込みエラーが未解決です。再読み込みまたはクリアしてください。');
+    if (icsStatus !== 'unloaded') fail('ICS状態が不正です。画面を確認してください。');
+    if (externalAcknowledged !== true) fail('ICS未読み込みです。外部予定が未確認であることへの確認チェックが必要です。');
+  }
+  function checkDestination({ start, end, icsStatus, externalAcknowledged, events }, current) {
+    checkICS(icsStatus, externalAcknowledged);
     if (!validRange(start, end)) fail('予約は月〜金9:00〜18:00の30分枠を選択してください。');
     if (start <= Date.now()) fail('過去または開始済みの日時は予約できません。');
-    if (events.some(event => event.status !== 'CANCELLED' && Calendar.overlaps(event, { start, end })) ||
+    if ((icsStatus === 'ready' && events.some(event => event.status !== 'CANCELLED' && Calendar.overlaps(event, { start, end }))) ||
         current.some(item => item.status === 'confirmed' && Calendar.overlaps(item, { start, end }))) {
       fail('この枠にはICS予定または予約があるため登録できません。');
     }
   }
   const unchanged = (item, snapshot) => Boolean(item && snapshot &&
     ['id', 'name', 'email', 'start', 'end', 'status', 'createdAt', 'cancelledAt'].every(key => item[key] === snapshot[key]));
-  function reschedule({ snapshot, start, end, icsReady, events }) {
+  function reschedule({ snapshot, start, end, context }) {
     const current = BookingStorage.read();
     const target = current.find(item => snapshot && item.id === snapshot.id);
     if (!target || target.status !== 'confirmed') fail('この予約は存在しないか、キャンセル済みのため変更できません。');
     if (!unchanged(target, snapshot)) fail('別タブなどで予約が変更されています。日時変更を中止して一覧からやり直してください。');
     if (target.start === start && target.end === end) fail('同じ日時への変更は不要です。別の枠を選択してください。');
-    checkDestination({ start, end, icsReady, events }, current.filter(item => item.id !== target.id));
+    const request = { operation: 'reschedule', start, end, snapshot, excludeId: target.id };
+    checkDestination({ start, end, ...resolveContext(context, request) }, current.filter(item => item.id !== target.id));
     const next = current.map(item => item.id === target.id ? { ...item, start, end } : item);
-    BookingStorage.write(next);
-    return next;
+    return commit(next, current, context, request);
   }
-  function register({ name, email, start, end, icsReady, events }) {
+  function register({ name, email, start, end, context }) {
     const normalized = input(name, email);
-    if (!icsReady) fail('予約確定にはICSファイルの読み込みが必要です。');
+    const request = { operation: 'booking', start, end };
+    const policy = resolveContext(context, request);
+    checkICS(policy.icsStatus, policy.externalAcknowledged);
     if (!validRange(start, end)) fail('予約は月〜金9:00〜18:00の30分枠を選択してください。');
     if (start <= Date.now()) fail('過去または開始済みの日時は予約できません。');
     const current = BookingStorage.read();
-    checkDestination({ start, end, icsReady, events }, current);
+    checkDestination({ start, end, ...policy }, current);
     const now = Date.now();
     if (start <= now) fail('開始済みの日時は予約できません。別の枠を選択してください。');
     const reservation = { id: uniqueId(current), ...normalized, start, end, status: 'confirmed', createdAt: now, cancelledAt: null };
     const next = [...current, reservation];
-    BookingStorage.write(next);
-    return next;
+    return commit(next, current, context, request);
   }
   function cancel(id) {
     const current = BookingStorage.read();
@@ -93,5 +120,5 @@ window.Reservations = (() => {
     BookingStorage.write(next);
     return next;
   }
-  return { input, validRange, validateData, register, cancel, reschedule, unchanged };
+  return { input, validRange, validateData, register, cancel, reschedule, unchanged, configureContext };
 })();
