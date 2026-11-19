@@ -777,3 +777,8 @@ button:disabled { opacity: .5; cursor: default; }
 .reschedule-mode h3 { font-size: 14px; }
 #reschedule-before, #reschedule-after { overflow-wrap: anywhere; }
 .card-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+
+.external-warning { background: #f5ebcf; border: 1px solid #b89a51; padding: 10px; margin-top: 12px; font-size: 12px; overflow-wrap: anywhere; }
+dialog .acknowledgement { display: flex; align-items: flex-start; gap: 9px; color: var(--ink); line-height: 1.7; margin: 10px 0 0; }
+dialog .acknowledgement input { width: 18px; height: 18px; flex: 0 0 18px; margin: 3px 0 0; accent-color: var(--accent); }
+.acknowledgement span { min-width: 0; overflow-wrap: anywhere; }

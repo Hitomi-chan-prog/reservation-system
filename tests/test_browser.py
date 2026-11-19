@@ -324,8 +324,9 @@ with sync_playwright() as p:
 
     def duplicate(target, _):
         book(target)
+        target.evaluate('openReservationDialog(dateAt(0),2)')
         result = target.evaluate('''() => {
-            try { Reservations.register({...reservations[0],name:'他の人',email:'b@example.com',icsReady:true,events:[]}); return ''; }
+            try { Reservations.register({...reservations[0],name:'他の人',email:'b@example.com',...bookingContext('booking')}); return ''; }
             catch (error) { return error.message; }
         }''')
         assert '予約' in result and len(read_bookings(target)) == 1
@@ -345,13 +346,14 @@ with sync_playwright() as p:
         assert not read_bookings(target)
     run_booking_test('STEP3 ICS予定枠の表示・登録拒否', busy_slot)
 
+    # STEP 6: 未読み込み自体は禁止せず、未確認チェックなしの送信を拒否する。
     def unloaded(target, _):
         open_booking(target)
         assert target.locator('#confirm-booking').is_disabled()
         target.locator('#booking-form').evaluate('(form) => form.requestSubmit()')
         assert 'ICS' in target.locator('#booking-error').inner_text()
         assert not read_bookings(target)
-    run_booking_test('STEP3 ICS未読み込み時の確定拒否', unloaded)
+    run_booking_test('STEP3/6 ICS未読み込み・確認チェックなしの確定拒否', unloaded)
 
     def past(target, _):
         load_ics(target)
@@ -390,6 +392,7 @@ with sync_playwright() as p:
         assert slot(target).get_attribute('class') == 'reserved'
     run_booking_test('STEP3 確定直前localStorage再判定', recheck_storage)
 
+    # STEP 6: 再読み込み後も予約は保持し、外部未確認への同意だけを再取得する。
     def persistence(target, _):
         book(target)
         raw = target.evaluate('JSON.parse(localStorage.getItem(BookingStorage.key))')
@@ -401,7 +404,7 @@ with sync_playwright() as p:
         assert target.evaluate('importedEvents.size === 0 && importedFiles.size === 0')
         open_booking(target, 3)
         assert target.locator('#confirm-booking').is_disabled()
-    run_booking_test('STEP3 保存・再読み込み復元・ICS再読込必須', persistence)
+    run_booking_test('STEP3/6 保存・再読み込み復元・未確認同意リセット', persistence)
 
     def cancel_booking(target, _):
         book(target)
@@ -1014,9 +1017,16 @@ with sync_playwright() as p:
         assert target.locator('#reschedule-dialog').evaluate('(e) => e.open')
 
     def rejected_change(target, **values):
+        # 呼び出し引数でICS状態を偽装せず、現在の画面と状態から確認トークンを取得する。
         result = target.evaluate("""values => {
+          if (values.events) values.events.forEach((event, i) => importedEvents.set(`reject-${i}`, event));
+          if (values.icsStatus === 'unloaded') document.getElementById('clear-files').click();
+          if (!rescheduleSnapshot) startReschedule(reservations[0].id);
+          if (!document.getElementById('reschedule-dialog').open) openReservationDialog(dateAt(0),4);
+          const range = { ...rescheduleRange, ...values };
+          rescheduleRange = {start:range.start,end:range.end};
           try {
-            Reservations.reschedule({snapshot: reservations[0], ...Calendar.slotRange(displayedMonday, 4), icsReady: true, events: [], ...values});
+            Reservations.reschedule({snapshot: reservations[0], ...rescheduleRange, ...bookingContext('reschedule')});
             return '';
           } catch (error) { return error.message; }
         }""", values)
@@ -1037,7 +1047,7 @@ with sync_playwright() as p:
         target.evaluate(r"showSelectedFiles([new File(['BEGIN:VCALENDAR\nVERSION:2.0\nEND:VCALENDAR\n'], 'ok.ics')])")
         target.evaluate('async () => { await importQueue; }')
         assert target.locator('#confirm-booking').is_enabled()
-        assert '読み込みが完了' in target.locator('#booking-hint').inner_text()
+        assert '読み込み成功' in target.locator('#booking-hint').inner_text()
         target.evaluate("showSelectedFiles([new File(['bad'], 'bad-again.ics')])")
         target.evaluate('async () => { await importQueue; }')
         assert target.locator('#confirm-booking').is_disabled()
@@ -1147,11 +1157,16 @@ with sync_playwright() as p:
                 target.evaluate('reservations = Reservations.cancel(reservations[0].id); renderAll()')
                 raw = target.evaluate('localStorage.getItem(BookingStorage.key)')
                 assert target.locator('#reservation-list .reschedule-button').count() == 0
+                message = target.evaluate("""() => { try {Reservations.reschedule({snapshot:reservations[0],...Calendar.slotRange(displayedMonday,4)});return '';}catch(e){return e.message;} }""")
+                assert 'キャンセル済み' in message
+                assert target.evaluate('localStorage.getItem(BookingStorage.key)') == raw
+                return
             else:
-                values['icsReady'] = False
+                values['icsStatus'] = 'unloaded'
             rejected_change(target, **values)
             assert target.evaluate('localStorage.getItem(BookingStorage.key)') == raw
             if case == 'other':
+                target.locator('#dismiss-reschedule').click()
                 target.locator('#reservation-list .reschedule-button').first.click()
                 assert slot(target, 4).locator('button').count() == 0
         run_booking_test(f'STEP5 変更拒否・保存不変 {case}', reject_destination)
@@ -1175,17 +1190,19 @@ with sync_playwright() as p:
             other = context.new_page()
             freeze(other)
             other.goto(url)
-            other.evaluate("""operation => {
-                if (operation === 'cancel') Reservations.cancel(reservations[0].id);
-                else Reservations.reschedule({snapshot: reservations[0], ...Calendar.slotRange(displayedMonday, 6), icsReady: true, events: []});
-            }""", operation)
+            if operation == 'cancel':
+                other.evaluate('Reservations.cancel(reservations[0].id)')
+            else:
+                start_change(other, 6)
+                other.locator('#reschedule-external-ack').check()
+                other.locator('#confirm-reschedule').click()
             target.wait_for_function('!Reservations.unchanged(reservations[0], rescheduleSnapshot)')
             assert target.locator('#confirm-reschedule').is_disabled()
             assert '別タブ' in target.locator('#reschedule-hint').inner_text()
             raw = other.evaluate('localStorage.getItem(BookingStorage.key)')
             # disabled制御を迂回しても保存前の再読込で古い上書きを拒否。
             message = target.evaluate("""() => { try {
-                Reservations.reschedule({snapshot: rescheduleSnapshot, ...rescheduleRange, icsReady:true, events:[]}); return '';
+                Reservations.reschedule({snapshot: rescheduleSnapshot, ...rescheduleRange, ...bookingContext('reschedule')}); return '';
             } catch(e) {return e.message;} }""")
             assert message
             assert target.evaluate('localStorage.getItem(BookingStorage.key)') == raw
@@ -1482,6 +1499,499 @@ with sync_playwright() as p:
         target.locator('#cancel-dialog').press('Escape')
         assert target.evaluate('localStorage.getItem(BookingStorage.key)') == raw
     run_booking_test('STEP5修正 UI文言・×・Escape・中止操作の保存不変', ui_labels)
+
+
+    # STEP 6: 未読み込みの明示同意と、読み込み中/エラーを区別する。
+    def optional_book(target, index=2):
+        open_booking(target, index)
+        assert target.locator('#booking-external-warning').is_visible()
+        target.locator('#booking-external-ack').check()
+        assert target.locator('#confirm-booking').is_enabled()
+        target.locator('#confirm-booking').click()
+        assert not target.locator('#reservation-dialog').evaluate('(e) => e.open')
+
+    def optional_registration(target, _):
+        assert '保存済み予約のみ' in target.locator('#ics-state').inner_text()
+        assert '重複する可能性' in target.locator('#ics-state').inner_text()
+        open_booking(target)
+        assert '確認チェックが必要' in target.locator('#booking-hint').inner_text()
+        assert target.locator('#confirm-booking').is_disabled()
+        target.locator('#booking-form').evaluate('(form) => form.requestSubmit()')
+        assert '確認チェック' in target.locator('#booking-error').inner_text()
+        assert not read_bookings(target)
+        target.locator('#booking-external-ack').check()
+        target.locator('#confirm-booking').click()
+        saved = read_bookings(target)
+        assert len(saved) == 1
+        assert slot(target).get_attribute('class') == 'reserved'
+        assert target.evaluate('importedFiles.size') == 0
+        assert set(saved[0]) == {'id','name','email','start','end','status','createdAt','cancelledAt'}
+        target.reload()
+        assert read_bookings(target) == saved
+        open_booking(target, 4)
+        assert not target.locator('#booking-external-ack').is_checked()
+        assert target.locator('#confirm-booking').is_disabled()
+    run_booking_test('STEP6 ICSなしの入力・警告・同意前拒否・同意後登録・保存/復元互換', optional_registration)
+
+    def reopen_ack(target, _):
+        for action in ['dismiss', 'escape', 'cross']:
+            open_booking(target)
+            target.locator('#booking-external-ack').check()
+            if action == 'escape': target.locator('#reservation-dialog').press('Escape')
+            elif action == 'cross': target.locator('.close-button').click()
+            else: target.locator('#dismiss-booking').click()
+            assert not read_bookings(target)
+            open_booking(target)
+            assert not target.locator('#booking-external-ack').is_checked()
+            assert target.locator('#confirm-booking').is_disabled()
+            target.locator('#dismiss-booking').click()
+        assert target.locator('#dismiss-booking').inner_text() == '入力をやめる'
+    run_booking_test('STEP6 ダイアログ再表示で確認リセット・Esc/×/入力中止のデータ不変', reopen_ack)
+
+    def optional_change(target, _):
+        optional_book(target)
+        before = read_bookings(target)[0]
+        start_change(target)
+        assert not target.locator('#reschedule-external-ack').is_checked()
+        assert target.locator('#confirm-reschedule').is_disabled()
+        assert '外部カレンダー' in target.locator('#reschedule-hint').inner_text()
+        target.locator('#reschedule-external-ack').check()
+        target.locator('#confirm-reschedule').click()
+        after = read_bookings(target)[0]
+        assert after == {**before, 'start': before['start']+3600000, 'end':before['end']+3600000}
+        assert slot(target, 2).locator('button').count() == 1
+        assert slot(target, 4).get_attribute('class') == 'reserved'
+        assert_focus(target, '#reservation-list .reschedule-button')
+        assert '11:00' in target.locator('#admin-reservation-list').inner_text()
+        target.reload()
+        assert read_bookings(target)[0] == after
+    run_booking_test('STEP6 ICSなしの日時変更・独立した同意・新旧枠・管理者・復元', optional_change)
+
+    def separate_ack(target, _):
+        optional_book(target)
+        start_change(target)
+        target.locator('#reschedule-external-ack').check()
+        raw = target.evaluate('localStorage.getItem(BookingStorage.key)')
+        target.locator('#reschedule-dialog').press('Escape')
+        assert target.evaluate('localStorage.getItem(BookingStorage.key)') == raw
+        start_change(target)
+        assert not target.locator('#reschedule-external-ack').is_checked()
+        assert target.locator('#confirm-reschedule').is_disabled()
+        target.locator('#dismiss-reschedule').click()
+        open_booking(target, 6)
+        assert not target.locator('#booking-external-ack').is_checked()
+        assert target.locator('#confirm-booking').is_disabled()
+    run_booking_test('STEP6 登録/変更の同意非共有・変更再表示でリセット', separate_ack)
+
+    for prefix in ['booking','reschedule']:
+        def state_changes(target, _, prefix=prefix):
+            if prefix == 'reschedule':
+                optional_book(target)
+                start_change(target)
+            else: open_booking(target)
+            checkbox = target.locator(f'#{prefix}-external-ack')
+            confirm = target.locator(f'#confirm-{prefix}')
+            checkbox.check()
+            assert confirm.is_enabled()
+            target.evaluate("""() => {
+                window.NativeReader=FileReader;
+                window.FileReader=class {readAsText(){window.optionalReader=this;} abort(){this.onabort();}};
+                showSelectedFiles([new File(['pending'],'pending.ics')]);
+            }""")
+            target.wait_for_function('Boolean(window.optionalReader)')
+            assert confirm.is_disabled()
+            assert not checkbox.is_checked()
+            assert '読み込み中' in target.locator(f'#{prefix}-hint').inner_text()
+            raw = target.evaluate('localStorage.getItem(BookingStorage.key)')
+            # disabledを迂回しても、現在の状態を保存直前に再検証する。
+            if prefix == 'booking': target.locator('#booking-form').evaluate('(form) => form.requestSubmit()')
+            else: confirm.evaluate('(button) => button.dispatchEvent(new MouseEvent("click"))')
+            assert target.evaluate('localStorage.getItem(BookingStorage.key)') == raw
+            target.evaluate("optionalReader.onerror()")
+            target.evaluate('async()=>{await importQueue;}')
+            assert confirm.is_disabled()
+            assert 'エラー' in target.locator(f'#{prefix}-hint').inner_text()
+            assert not checkbox.is_checked()
+            target.evaluate("""() => {
+                window.FileReader=NativeReader;
+                document.getElementById('clear-files').click();
+            }""")
+            assert target.locator(f'#{prefix}-external-warning').is_visible()
+            assert not checkbox.is_checked()
+            assert confirm.is_disabled()
+            checkbox.check()
+            assert confirm.is_enabled()
+            # 同じ未読み込み状態への再クリアでも、前の同意を使わない。
+            target.evaluate("document.getElementById('clear-files').click()")
+            assert not checkbox.is_checked()
+            assert confirm.is_disabled()
+            checkbox.check()
+            target.evaluate('source => showSelectedFiles([new File([source], "ok.ics")])', empty_ics)
+            target.evaluate('async()=>{await importQueue;}')
+            assert target.locator(f'#{prefix}-external-warning').is_hidden()
+            assert not checkbox.is_checked()
+            assert confirm.is_enabled()
+            assert '最新性は保証' in target.locator(f'#{prefix}-hint').inner_text()
+            target.evaluate("document.getElementById('clear-files').click()")
+            assert target.locator(f'#{prefix}-external-warning').is_visible()
+            assert confirm.is_disabled()
+        run_booking_test(f'STEP6 {prefix}の読込中/エラー/クリア/成功と同意リセット・確定競合', state_changes)
+
+    for state in ['loading','error','unloaded','invalid']:
+        def domain_policy(target, _, state=state):
+            optional_book(target)
+            raw = target.evaluate('localStorage.getItem(BookingStorage.key)')
+            messages = target.evaluate("""state => {
+                if(state === 'loading') pendingImports=1;
+                if(state === 'error') importFailed=true;
+                openReservationDialog(dateAt(0),4);
+                const booking = state === 'invalid' ? {context:{}} : bookingContext('booking');
+                let first;
+                try {Reservations.register({...selectedRange,name:'検証',email:'test@example.com',...booking});first='';}catch(e){first=e.message;}
+                document.getElementById('reservation-dialog').close();
+                startReschedule(reservations[0].id);openReservationDialog(dateAt(0),4);
+                const change = state === 'invalid' ? {context:{}} : bookingContext('reschedule');
+                let second;
+                try {Reservations.reschedule({snapshot:rescheduleSnapshot,...rescheduleRange,...change});second='';}catch(e){second=e.message;}
+                return [first,second];
+            }""", state)
+            assert all(messages), messages
+            assert target.evaluate('localStorage.getItem(BookingStorage.key)') == raw
+        run_booking_test(f'STEP6 保存処理がICS状態/同意を再検証 {state}', domain_policy)
+
+    for operation in ['register','change']:
+        for reason in ['overlap','past']:
+            def optional_reject(target, _, operation=operation, reason=reason):
+                optional_book(target)
+                raw = target.evaluate('localStorage.getItem(BookingStorage.key)')
+                message = target.evaluate("""args => {
+                    const range=args.reason==='past' ? Calendar.slotRange(new Date(Date.UTC(2026,5,26)),0) : {start:reservations[0].start,end:reservations[0].end};
+                    if (args.operation==='change') {
+                        const second={...reservations[0],id:'second',...Calendar.slotRange(displayedMonday,6)};
+                        BookingStorage.write([...reservations,second]);reloadReservations();
+                        startReschedule(second.id);
+                        openReservationDialog(dateAt(0),4);
+                        rescheduleRange=range;
+                        document.getElementById('reschedule-external-ack').checked=true;
+                        try {Reservations.reschedule({...range,snapshot:second,...bookingContext('reschedule')});return '';}catch(e){return e.message;}
+                    }
+                    openReservationDialog(dateAt(0),4);
+                    selectedRange=range;
+                    document.getElementById('booking-external-ack').checked=true;
+                    try {Reservations.register({...range,name:'追加',email:'add@example.com',...bookingContext('booking')});return '';}catch(e){return e.message;}
+                }""", {'operation':operation,'reason':reason})
+                assert '過去' in message if reason == 'past' else '予約がある' in message
+                if operation == 'register':
+                    assert target.evaluate('localStorage.getItem(BookingStorage.key)') == raw
+                else:
+                    assert read_bookings(target)[0] == json.loads(raw)['reservations'][0]
+                    assert read_bookings(target)[1]['start'] == int(datetime(2026,6,29,3,tzinfo=timezone.utc).timestamp()*1000)
+            run_booking_test(f'STEP6 ICSなしでも{operation}の{reason}を拒否', optional_reject)
+
+    def partial_error(target, _):
+        open_booking(target)
+        target.locator('#booking-external-ack').check()
+        target.locator('#dismiss-booking').click()
+        load_ics(target)
+        # 同時にキューへ追加した一部が失敗しても、後続成功でエラーを隠さない。
+        target.evaluate("""sources => {
+            showSelectedFiles([new File([sources[0]],'good.ics'),new File(['bad'],'bad.ics')]);
+            showSelectedFiles([new File([sources[1]],'queued.ics')]);
+        }""", [event('partial'), empty_ics])
+        target.evaluate('async()=>{await importQueue;}')
+        open_booking(target)
+        assert 'エラー' in target.locator('#booking-hint').inner_text()
+        assert 'bad.ics' in target.locator('#import-error').inner_text()
+        assert target.locator('#confirm-booking').is_disabled()
+        assert target.locator('#booking-external-warning').is_hidden()
+        target.locator('#dismiss-booking').click()
+        load_ics(target)
+        open_booking(target)
+        assert target.locator('#confirm-booking').is_enabled()
+        assert target.locator('#booking-external-warning').is_hidden()
+    run_booking_test('STEP6 追加/複数ICSの部分失敗・後続成功でエラーを隠さず正常再読込で復帰', partial_error)
+
+    for count in [16,20]:
+        def optional_many(target, _, count=count):
+            seed(target,count)
+            target.locator('#calendar-body tr').nth(17).locator('td').nth(1).locator('button').click()
+            target.locator('#customer-name').fill('ICSなし追加')
+            target.locator('#customer-email').fill('optional@example.com')
+            target.locator('#booking-external-ack').check()
+            target.locator('#confirm-booking').click()
+            assert len([r for r in read_bookings(target) if r['status']=='confirmed'])==count+1
+            if count == 20:
+                target.locator('#booking-next').click()
+                assert target.locator('#booking-page').inner_text()=='2 / 2ページ'
+                assert 'ICSなし追加' in target.locator('#reservation-list').inner_text()
+        run_booking_test(f'STEP6 ICSなしで{count+1}件目登録・確定ページ表示', optional_many)
+
+    def cancelled_pages(target, _):
+        seed(target,21)
+        target.evaluate("""()=>{
+            const items=BookingStorage.read().filter(item=>item.status==='confirmed').map(item=>({...item,status:'cancelled',cancelledAt:Date.now()}));
+            BookingStorage.write(items);reloadReservations();
+        }""")
+        target.locator('#cancelled-tab').click()
+        assert target.locator('#reservation-list .reservation-card').count()==20
+        target.locator('#booking-next').click()
+        assert target.locator('#booking-page').inner_text()=='2 / 2ページ'
+        assert '全21件中 21〜21件を表示' in target.locator('#booking-range').inner_text()
+        assert '利用者20' in target.locator('#reservation-list').inner_text()
+        assert target.locator('#reservation-list button').count()==0
+        raw=target.evaluate('localStorage.getItem(BookingStorage.key)')
+        target.reload()
+        assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+        assert len(read_bookings(target))==21
+    run_booking_test('STEP6 キャンセル履歴21件のページ・参照専用・再読込保持', cancelled_pages)
+
+    for operation in ['booking','reschedule']:
+        def optional_storage_failure(target, _, operation=operation):
+            if operation == 'reschedule':
+                optional_book(target)
+                start_change(target)
+            else: open_booking(target)
+            raw=target.evaluate('localStorage.getItem(BookingStorage.key)')
+            target.locator(f'#{operation}-external-ack').check()
+            target.evaluate("() => {Storage.prototype.setItem=()=>{throw Error('quota');};}")
+            target.locator(f'#confirm-{operation}').click()
+            assert '保存できません' in target.locator(f'#{operation}-error').inner_text()
+            assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+            assert not target.locator('#operation-status').inner_text()
+        run_booking_test(f'STEP6 ICSなし{operation}の保存失敗で元データ保護', optional_storage_failure)
+
+    def optional_layout(target, _):
+        optional_book(target)
+        payload='<img src=x onerror=window.optionalXSS=true>'+'A'*45
+        target.evaluate("""name=>{reservations[0].name=name;BookingStorage.write(reservations);renderAll();}""",payload)
+        for width in [1440,390]:
+            target.set_viewport_size({'width':width,'height':1000})
+            open_booking(target,6)
+            assert target.locator('#booking-external-warning').is_visible()
+            target.locator('#booking-external-ack').focus()
+            target.locator('#booking-external-ack').press('Space')
+            assert target.locator('#confirm-booking').is_enabled()
+            assert target.evaluate('document.documentElement.scrollWidth<=innerWidth')
+            assert target.locator('#reservation-dialog').evaluate('(e)=>e.scrollWidth<=e.clientWidth')
+            assert target.locator('#booking-external-warning').evaluate('(e)=>e.scrollWidth<=e.clientWidth')
+            if os.environ.get('TEST_ARTIFACT_DIR'):
+                target.screenshot(path=str(Path(os.environ['TEST_ARTIFACT_DIR'])/f'step6-booking-{width}.png'))
+            target.locator('#reservation-dialog').press('Escape')
+            start_change(target)
+            assert payload in target.locator('#reschedule-before').inner_text()
+            assert target.locator('#reschedule-dialog img').count()==0
+            assert target.evaluate('window.optionalXSS===undefined')
+            assert target.locator('#reschedule-external-warning').is_visible()
+            assert target.locator('#reschedule-dialog').evaluate('(e)=>e.scrollWidth<=e.clientWidth')
+            if os.environ.get('TEST_ARTIFACT_DIR'):
+                target.screenshot(path=str(Path(os.environ['TEST_ARTIFACT_DIR'])/f'step6-change-{width}.png'))
+            target.locator('#reschedule-external-ack').focus()
+            target.locator('#reschedule-external-ack').press('Space')
+            assert target.locator('#confirm-reschedule').is_enabled()
+            target.locator('#reschedule-dialog').press('Escape')
+            assert_focus(target,'#reservation-list .reschedule-button')
+        assert read_bookings(target)[0]['name']==payload
+    run_booking_test('STEP6 未確認チェック/警告の1440px/390px・Space/Esc・フォーカス・XSS', optional_layout)
+
+
+    # Medium回帰: 呼び出し側の状態/同意ではなく、現在の操作に結び付いたトークンを検証。
+    def prepare_context(target, prefix):
+        seed(target,1)
+        if prefix=='booking': open_booking(target,4)
+        else: start_change(target)
+        target.locator(f'#{prefix}-external-ack').check()
+        target.evaluate("""prefix=>{
+            window.heldContext=bookingContext(prefix);
+            window.heldOptions={...(prefix==='booking'?selectedRange:rescheduleRange)};
+            if(prefix==='reschedule') heldOptions.snapshot={...rescheduleSnapshot};
+        }""",prefix)
+
+    def direct_save(target, prefix, fresh=False):
+        return target.evaluate("""args=>{
+            const options={...heldOptions,name:'直接登録',email:'direct@example.com',
+                ...(args.fresh?bookingContext(args.prefix):heldContext),
+                // この偽装値は保存判断に使用されてはいけない。
+                icsStatus:'ready',externalAcknowledged:true,events:[]};
+            try {
+                if(args.prefix==='booking') Reservations.register(options);
+                else Reservations.reschedule(options);
+                return {saved:true,message:''};
+            }catch(e){return {saved:false,message:e.message};}
+        }""",{'prefix':prefix,'fresh':fresh})
+
+    for prefix in ['booking','reschedule']:
+        for transition in ['clear','error','ready-busy','loading','uncheck','recheck','close','reopen','other-operation']:
+            def stale_context(target, _, prefix=prefix, transition=transition):
+                prepare_context(target,prefix)
+                dialog='#reservation-dialog' if prefix=='booking' else '#reschedule-dialog'
+                if transition=='clear': target.evaluate("document.getElementById('clear-files').click()")
+                elif transition=='error':
+                    target.evaluate("showSelectedFiles([new File(['bad'],'bad.ics')])")
+                    target.evaluate('async()=>{await importQueue;}')
+                elif transition=='ready-busy':
+                    target.evaluate('source=>showSelectedFiles([new File([source],"busy.ics")])',event('new-conflict',start='20260629T110000',end='20260629T113000'))
+                    target.evaluate('async()=>{await importQueue;}')
+                elif transition=='loading':
+                    target.evaluate("""()=>{
+                        window.NativeReader=FileReader;
+                        window.FileReader=class {readAsText(){window.mediumReader=this;}};
+                        showSelectedFiles([new File(['pending'],'pending.ics')]);
+                    }""")
+                    target.wait_for_function('Boolean(window.mediumReader)')
+                elif transition in ['uncheck','recheck']:
+                    target.locator(f'#{prefix}-external-ack').uncheck()
+                    if transition=='recheck': target.locator(f'#{prefix}-external-ack').check()
+                elif transition=='close': target.locator(dialog).press('Escape')
+                elif transition=='reopen':
+                    target.locator(dialog).press('Escape')
+                    if prefix=='booking': open_booking(target,4)
+                    else: start_change(target)
+                    target.locator(f'#{prefix}-external-ack').check()
+                else:
+                    target.locator(dialog).press('Escape')
+                    if prefix=='booking':
+                        start_change(target)
+                        target.locator('#reschedule-external-ack').check()
+                    else:
+                        open_booking(target,4)
+                        target.locator('#booking-external-ack').check()
+                raw=target.evaluate('localStorage.getItem(BookingStorage.key)')
+                result=direct_save(target,prefix)
+                assert not result['saved'],(prefix,transition,result)
+                assert '再確認' in result['message'],result
+                assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+                if transition=='ready-busy':
+                    # 最新トークンでも古いevents:[]を渡して重複判定を回避できない。
+                    fresh=direct_save(target,prefix,fresh=True)
+                    assert not fresh['saved'] and 'ICS予定' in fresh['message'],fresh
+                    assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+                if transition=='loading':
+                    target.evaluate('async()=>{mediumReader.onerror();await importQueue;window.FileReader=NativeReader;}')
+            run_booking_test(f'STEP6 Medium 古いcontext拒否・保存不変 {prefix}/{transition}',stale_context)
+
+    for prefix in ['booking','reschedule']:
+        for recovery in ['clear','error','loaded-safe']:
+            def latest_context(target, _, prefix=prefix, recovery=recovery):
+                prepare_context(target,prefix)
+                before=read_bookings(target)
+                if recovery=='clear':
+                    target.evaluate("document.getElementById('clear-files').click()")
+                    target.locator(f'#{prefix}-external-ack').check()
+                else:
+                    if recovery=='error':
+                        target.evaluate("showSelectedFiles([new File(['bad'],'bad.ics')])")
+                        target.evaluate('async()=>{await importQueue;}')
+                    target.evaluate('source=>showSelectedFiles([new File([source],"normal.ics")])',empty_ics)
+                    target.evaluate('async()=>{await importQueue;}')
+                    assert target.locator(f'#{prefix}-external-warning').is_hidden()
+                result=direct_save(target,prefix,fresh=True)
+                assert result['saved'],result
+                after=read_bookings(target)
+                assert after[1]==before[1]  # キャンセル履歴維持。
+                if prefix=='booking': assert len(after)==len(before)+1
+                else:
+                    assert len(after)==len(before)
+                    assert after[0]=={**before[0],'start':1782698400000,'end':1782700200000}
+                target.reload()
+                assert read_bookings(target)==after
+            run_booking_test(f'STEP6 Medium 最新contextの直接保存・復元 {prefix}/{recovery}',latest_context)
+
+    for prefix in ['booking','reschedule']:
+        def latest_events(target, _, prefix=prefix):
+            prepare_context(target,prefix)
+            # 未読み込みの古い同意トークンから、読み込み済みの最新トークンへ切替。
+            target.evaluate('source=>showSelectedFiles([new File([source],"normal.ics")])',empty_ics)
+            target.evaluate('async()=>{await importQueue;}')
+            target.evaluate('prefix=>{window.heldContext=bookingContext(prefix);}',prefix)
+            # トークン取得後に予定が更新されても、保存時は現在のMapを使用。
+            target.evaluate("importedEvents.set('last-second',{start:1782698400000,end:1782700200000,status:'CONFIRMED',summary:'直前の予定'})")
+            raw=target.evaluate('localStorage.getItem(BookingStorage.key)')
+            result=direct_save(target,prefix)
+            assert not result['saved'] and 'ICS予定' in result['message'],result
+            assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+        run_booking_test(f'STEP6 Medium 現在のICS予定を直接呼び出しでも再取得 {prefix}',latest_events)
+
+    def forged_context(target, _):
+        prepare_context(target,'booking')
+        raw=target.evaluate('localStorage.getItem(BookingStorage.key)')
+        messages=target.evaluate("""()=>{
+            const results=[];
+            for(const options of [
+                {icsStatus:'ready',externalAcknowledged:true,events:[]},
+                {context:{...heldContext.context}},
+                {context:{},icsStatus:'unloaded',externalAcknowledged:true}
+            ]) {
+                try{Reservations.register({...heldOptions,name:'偽装',email:'fake@example.com',...options});results.push('');}
+                catch(e){results.push(e.message);}
+            }
+            try{Reservations.configureContext(()=>({icsStatus:'ready',events:[]}));results.push('');}
+            catch(e){results.push(e.message);}
+            return results;
+        }""")
+        assert all(messages),messages
+        assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+        # 同じトークンを別の予約枠へ転用しない。
+        result=target.evaluate("""()=>{try{
+            Reservations.register({...Calendar.slotRange(displayedMonday,6),name:'転用',email:'a@example.com',...heldContext});return '';
+        }catch(e){return e.message;}}""")
+        assert '再確認' in result
+    run_booking_test('STEP6 Medium context偽装・別枠転用・取得元差し替えを拒否',forged_context)
+
+    def consumed_context(target, _):
+        prepare_context(target,'booking')
+        result=direct_save(target,'booking')
+        assert result['saved'],result
+        raw=target.evaluate('localStorage.getItem(BookingStorage.key)')
+        second=direct_save(target,'booking')
+        assert not second['saved'] and '再確認' in second['message']
+        assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+    run_booking_test('STEP6 Medium 成功した操作トークンを再利用しない',consumed_context)
+
+    def final_storage_change(target, _):
+        prepare_context(target,'booking')
+        target.evaluate("""()=>{
+            window.nativeUUID=crypto.randomUUID;
+            crypto.randomUUID=()=>{
+                const items=BookingStorage.read();
+                BookingStorage.write([...items,{...items[0],id:'concurrent',...Calendar.slotRange(displayedMonday,6)}]);
+                return 'new-review-id';
+            };
+        }""")
+        result=direct_save(target,'booking')
+        assert not result['saved'] and '保存直前' in result['message'],result
+        assert [item['id'] for item in read_bookings(target)]==['step3-0','history','concurrent']
+        target.evaluate('()=>{crypto.randomUUID=nativeUUID;}')
+    run_booking_test('STEP6 Medium 保存直前の予約データ更新も上書きしない',final_storage_change)
+
+
+    for prefix in ['booking','reschedule']:
+        for transition in ['clear','new-busy']:
+            def during_commit(target, _, prefix=prefix, transition=transition):
+                prepare_context(target,prefix)
+                if transition=='new-busy':
+                    target.evaluate('source=>showSelectedFiles([new File([source],"ok.ics")])',empty_ics)
+                    target.evaluate('async()=>{await importQueue;}')
+                    target.evaluate('prefix=>{heldContext=bookingContext(prefix);}',prefix)
+                raw=target.evaluate('localStorage.getItem(BookingStorage.key)')
+                target.evaluate("""transition=>{
+                    window.nativeRead=BookingStorage.read;
+                    let reads=0;
+                    BookingStorage.read=()=>{
+                        const data=nativeRead();
+                        reads+=1;
+                        if(reads===2) {
+                            if(transition==='clear') document.getElementById('clear-files').click();
+                            else importedEvents.set('at-commit',{start:1782698400000,end:1782700200000,status:'CONFIRMED'});
+                        }
+                        return data;
+                    };
+                }""",transition)
+                result=direct_save(target,prefix)
+                assert not result['saved'],result
+                assert ('再確認' if transition=='clear' else 'ICS予定') in result['message']
+                assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+                target.evaluate('()=>{BookingStorage.read=nativeRead;}')
+            run_booking_test(f'STEP6 Medium 保存直前の{transition}を再検証 {prefix}',during_commit)
 
     print(json.dumps({'sample_events': len(events), 'browser_errors': errors, 'passed': len(passed), 'failed': len(failures), 'test_groups': passed, 'failures': failures}, ensure_ascii=False))
     assert not failures, failures
