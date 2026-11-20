@@ -4,6 +4,10 @@ from playwright.sync_api import sync_playwright
 import json
 import os
 import re
+import csv
+import io
+import hashlib
+from icalendar import Calendar as ExternalCalendar
 from datetime import datetime, timezone, timedelta
 ROOT = Path(__file__).resolve().parents[1]
 SAMPLE = next((ROOT / 'samples').glob('*.ics'))
@@ -408,19 +412,19 @@ with sync_playwright() as p:
 
     def cancel_booking(target, _):
         book(target)
-        target.locator('#reservation-list .card-actions button:not(.reschedule-button)').click()
+        target.locator('#reservation-list .cancel-reservation-button').click()
         assert target.locator('#cancel-dialog').evaluate('(e) => e.open')
         assert '山田 花子' in target.locator('#cancel-detail').inner_text()
         target.locator('#dismiss-cancel').click()
         assert read_bookings(target)[0]['status'] == 'confirmed'
-        target.locator('#reservation-list .card-actions button:not(.reschedule-button)').click()
+        target.locator('#reservation-list .cancel-reservation-button').click()
         target.locator('#confirm-cancel').click()
         saved = read_bookings(target)[0]
         assert saved['status'] == 'cancelled' and saved['cancelledAt'] is not None
         assert slot(target).locator('button').count() == 1
-        assert target.locator('#reservation-list .card-actions button:not(.reschedule-button)').count() == 0
+        assert target.locator('#reservation-list .cancel-reservation-button').count() == 0
         target.locator('#cancelled-tab').click()
-        assert target.locator('#reservation-list .card-actions button:not(.reschedule-button)').count() == 0
+        assert target.locator('#reservation-list .cancel-reservation-button').count() == 0
         result = target.evaluate('''() => { try { Reservations.cancel(reservations[0].id); return ''; } catch(e) { return e.message; } }''')
         assert 'キャンセル済み' in result
         target.reload()
@@ -435,7 +439,7 @@ with sync_playwright() as p:
         assert '競合' in target.locator('#conflict-warning').inner_text()
         assert read_bookings(target)[0]['status'] == 'confirmed'
         assert slot(target).get_attribute('class') == 'reserved'
-        target.locator('#reservation-list .card-actions button:not(.reschedule-button)').click()
+        target.locator('#reservation-list .cancel-reservation-button').click()
         target.locator('#confirm-cancel').click()
         assert slot(target).get_attribute('class') == 'busy'
     run_booking_test('STEP3 ICS競合警告・予約保護・取消後ICS枠維持', conflict)
@@ -478,7 +482,7 @@ with sync_playwright() as p:
 
     def cancel_failure(target, _):
         book(target)
-        target.locator('#reservation-list .card-actions button:not(.reschedule-button)').click()
+        target.locator('#reservation-list .cancel-reservation-button').click()
         target.evaluate('''() => { Storage.prototype.setItem = function() { throw new Error('denied'); }; }''')
         target.locator('#confirm-cancel').click()
         assert '保存できません' in target.locator('#cancel-error').inner_text()
@@ -494,7 +498,7 @@ with sync_playwright() as p:
         other.wait_for_function('reservations.length === 1')
         assert other.locator('td.reserved').count() == 1
         assert '山田 花子' in other.locator('#admin-reservation-list').inner_text()
-        other.locator('#reservation-list .card-actions button:not(.reschedule-button)').click()
+        other.locator('#reservation-list .cancel-reservation-button').click()
         other.locator('#confirm-cancel').click()
         target.wait_for_function('reservations[0].status === "cancelled"')
         assert target.locator('td.reserved').count() == 0
@@ -718,7 +722,7 @@ with sync_playwright() as p:
         assert not target.locator('#reservation-dialog').evaluate('(e) => e.open')
         for width in [390, 1440]:
             target.set_viewport_size({'width': width, 'height': 900})
-            target.locator('#reservation-list .card-actions button:not(.reschedule-button)').click()
+            target.locator('#reservation-list .cancel-reservation-button').click()
             dialog = target.locator('#cancel-dialog')
             assert dialog.evaluate('(e) => e.open')
             detail = target.locator('#cancel-detail')
@@ -740,7 +744,7 @@ with sync_playwright() as p:
             assert not dialog.evaluate('(e) => e.open')
             assert read_bookings(target) == before
             assert before[0]['status'] == 'confirmed'
-        target.locator('#reservation-list .card-actions button:not(.reschedule-button)').click()
+        target.locator('#reservation-list .cancel-reservation-button').click()
         target.locator('#confirm-cancel').click()
         assert not target.locator('#cancel-dialog').evaluate('(e) => e.open')
         saved = read_bookings(target)[0]
@@ -779,7 +783,7 @@ with sync_playwright() as p:
         assert '履歴の人' not in target.locator('#reservation-list').inner_text()
         target.locator('#cancelled-tab').click()
         assert target.locator('#reservation-list .reservation-card').count() == 1
-        assert target.locator('#reservation-list .card-actions button:not(.reschedule-button)').count() == 0
+        assert target.locator('#reservation-list .cancel-reservation-button').count() == 0
         assert '2026/06/29' in target.locator('#reservation-list').inner_text()
         assert '09:00（日本時間）' in target.locator('#reservation-list').inner_text()
         target.locator('#cancelled-tab').press('ArrowLeft')
@@ -935,7 +939,7 @@ with sync_playwright() as p:
     def update(target, _):
         seed(target, 21)
         target.locator('#booking-next').click()
-        target.locator('#reservation-list .card-actions button:not(.reschedule-button)').click()
+        target.locator('#reservation-list .cancel-reservation-button').click()
         target.locator('#confirm-cancel').click()
         assert target.locator('#booking-page').inner_text() == '1 / 1ページ'
         assert target.locator('#confirmed-tab').inner_text() == '確定予約（20件）'
@@ -1381,7 +1385,7 @@ with sync_playwright() as p:
             if action != 'success':
                 assert target.evaluate('localStorage.getItem(BookingStorage.key)') == raw
             target.locator('#reservation-list .reschedule-button').press('Tab')
-            assert_focus(target, '#reservation-list .card-actions button:not(.reschedule-button)')
+            assert_focus(target, '#reservation-list .cancel-reservation-button')
         run_booking_test(f'STEP5修正 キーボード{action}後に対象カードへフォーカス復元', restored_focus)
 
     def filtered_focus(target, _):
@@ -1490,12 +1494,12 @@ with sync_playwright() as p:
         assert target.locator('#confirm-reschedule').inner_text() == '変更を確定する'
         target.locator('#dismiss-reschedule').press('Enter')
         assert target.evaluate('localStorage.getItem(BookingStorage.key)') == raw
-        target.locator('#reservation-list .card-actions button:not(.reschedule-button)').press('Enter')
+        target.locator('#reservation-list .cancel-reservation-button').press('Enter')
         assert target.locator('#dismiss-cancel').inner_text() == '戻る'
         assert target.locator('#confirm-cancel').inner_text() == 'キャンセルを確定する'
         target.locator('#dismiss-cancel').press('Enter')
         assert target.evaluate('localStorage.getItem(BookingStorage.key)') == raw
-        target.locator('#reservation-list .card-actions button:not(.reschedule-button)').press('Enter')
+        target.locator('#reservation-list .cancel-reservation-button').press('Enter')
         target.locator('#cancel-dialog').press('Escape')
         assert target.evaluate('localStorage.getItem(BookingStorage.key)') == raw
     run_booking_test('STEP5修正 UI文言・×・Escape・中止操作の保存不変', ui_labels)
@@ -1992,6 +1996,334 @@ with sync_playwright() as p:
                 assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
                 target.evaluate('()=>{BookingStorage.read=nativeRead;}')
             run_booking_test(f'STEP6 Medium 保存直前の{transition}を再検証 {prefix}',during_commit)
+
+
+    # STEP 7: 実ダウンロードのバイト列をCSV標準ライブラリと独立したICSライブラリで検証。
+    def export_open(target, format, scope='confirmed', names=False, individual=False):
+        if format=='csv': target.locator('#csv-scope').select_option(scope)
+        else: target.locator('#ics-include-names').set_checked(names)
+        target.locator('#reservation-list .ics-export-button' if individual else '#csv-export' if format=='csv' else '#ics-export-all').first.click()
+        assert target.locator('#export-dialog').evaluate('(e)=>e.open')
+
+    def export_bytes(target):
+        with target.expect_download() as pending:
+            target.locator('#confirm-export').click()
+        download=pending.value
+        assert download.failure() is None
+        data=Path(download.path()).read_bytes()
+        target.locator('#export-dialog').wait_for(state='hidden')
+        return data,download.suggested_filename
+
+    def csv_rows(data):
+        assert data.startswith(b'\xef\xbb\xbf')
+        return list(csv.reader(io.StringIO(data.decode('utf-8-sig'),newline='')))
+
+    def parsed_calendar(data):
+        assert data.endswith(b'\r\n')
+        assert b'\n' not in data.replace(b'\r\n',b'') and b'\r' not in data.replace(b'\r\n',b'')
+        for line in data.split(b'\r\n'):
+            assert len(line)<=75,(len(line),line)
+            line.decode('utf-8','strict')
+        calendar=ExternalCalendar.from_ical(data)
+        assert str(calendar['VERSION'])=='2.0'
+        assert calendar.get('PRODID')
+        return [item for item in calendar.walk() if item.name=='VEVENT']
+
+    for scope,count in [('confirmed',41),('cancelled',1),('all',42)]:
+        def csv_scope(target, _, scope=scope,count=count):
+            raw=seed(target)
+            target.locator('#booking-search').fill('山田')
+            export_open(target,'csv',scope=scope)
+            assert f'対象 {count}件' in target.locator('#export-summary').inner_text()
+            assert '氏名・メールアドレス' in target.locator('#export-privacy').inner_text()
+            data,filename=export_bytes(target)
+            rows=csv_rows(data)
+            assert rows[0]==['予約ID','氏名','メールアドレス','予約日','開始時刻','終了時刻','状態','登録日時','キャンセル日時']
+            assert len(rows)==count+1
+            assert all(len(row)==9 for row in rows)
+            expected=read_bookings(target)
+            expected=[r for r in expected if scope=='all' or r['status']==scope]
+            expected.sort(key=lambda r:(r['start'],r['createdAt']))
+            assert [r[0] for r in rows[1:]]==[r['id'] for r in expected]
+            assert len({r[0] for r in rows[1:]})==count
+            assert filename==f'reservations-{scope}-2026-06-29.csv'
+            assert 'ダウンロードを開始' in target.locator('#export-status').inner_text()
+            assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+            assert target.locator('#booking-search').input_value()=='山田'
+        run_booking_test(f'STEP7 CSV実ファイル・BOM・全対象・検索非依存 {scope}',csv_scope)
+
+    def csv_special(target, _):
+        seed(target,1)
+        name='日本語, "引用"\n2行目;\\終わり'
+        target.evaluate("""name=>{
+            const items=BookingStorage.read();items[0].name=name;
+            items[1].cancelledAt=Date.parse('2026-06-29T15:00:00Z');BookingStorage.write(items);reloadReservations();
+        }""",name)
+        raw=target.evaluate('localStorage.getItem(BookingStorage.key)')
+        export_open(target,'csv',scope='all')
+        data,_=export_bytes(target);rows=csv_rows(data)
+        assert rows[1][1]==name
+        assert rows[1][3:7]==['2026-06-29','09:00','09:30','確定']
+        assert rows[1][7]=='1970-01-01 09:00:00' and rows[1][8]==''
+        assert rows[2][3]=='2026-06-29' and rows[2][6]=='キャンセル済み'
+        assert rows[2][8]=='2026-06-30 00:00:00'
+        assert data.endswith(b'\r\n') and b'""' in data
+        assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+    run_booking_test('STEP7 CSVのJST・元予約日・カンマ/引用符/改行のRFCエスケープ',csv_special)
+
+    for payload in ['=1+1','+SUM(1,2)','-1+2','@SUM(1,2)','  =1+1','\t=1+1','\r=1+1','\n=1+1','\u200b=1+1']:
+        def csv_formula(target, _, payload=payload):
+            seed(target,1)
+            target.evaluate("""id=>{const items=BookingStorage.read();items[0].id=id;items[0].name='=1+1';items[0].email='=test@example.com';BookingStorage.write(items);reloadReservations();}""",payload)
+            raw=target.evaluate('localStorage.getItem(BookingStorage.key)')
+            export_open(target,'csv')
+            data,_=export_bytes(target);row=csv_rows(data)[1]
+            assert row[0]=="'"+payload
+            assert row[1]=="'=1+1" and row[2]=="'=test@example.com"
+            assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+        run_booking_test(f'STEP7 CSVインジェクション対策 {payload!r}',csv_formula)
+
+    for names in [False,True]:
+        def ics_bulk(target, _, names=names):
+            raw=seed(target,41)
+            export_open(target,'ics',names=names)
+            assert '対象 41件' in target.locator('#export-summary').inner_text()
+            data,filename=export_bytes(target)
+            events=parsed_calendar(data)
+            expected=[r for r in read_bookings(target) if r['status']=='confirmed']
+            assert len(events)==41
+            assert len({str(e['UID']) for e in events})==41
+            for e,r in zip(events,expected):
+                assert e.decoded('DTSTART')==datetime.fromtimestamp(r['start']/1000,timezone.utc)
+                assert e.decoded('DTEND')==datetime.fromtimestamp(r['end']/1000,timezone.utc)
+                assert e.decoded('DTSTAMP')==datetime(2026,6,29,tzinfo=timezone.utc)
+                assert str(e['STATUS'])=='CONFIRMED'
+                assert str(e['SUMMARY'])==('予約: '+r['name'] if names else '予約あり')
+                uid=hashlib.sha256(('reservation-ledger:v1:'+r['id']).encode()).hexdigest()+'@reservation-ledger.invalid'
+                assert str(e['UID'])==uid
+                assert r['email'].encode() not in data
+            assert filename=='reservations-2026-06-29.ics'
+            # アプリ側パーサーとも照合。ただし独立したicalendarが一次検証。
+            parsed=target.evaluate('source=>ICSParser.parse(source)',data.decode())
+            assert len(parsed)==41 and parsed[0]['start']==expected[0]['start']
+            assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+        run_booking_test(f'STEP7 ICS一括実ファイル・外部解析・UTC・プライバシー names={names}',ics_bulk)
+
+    def individual_ics(target, _):
+        seed(target,21)
+        assert not target.locator('#ics-include-names').is_checked()
+        target.locator('#booking-next').click()
+        target.locator('#reservation-list .ics-export-button').click()
+        assert '対象 1件' in target.locator('#export-summary').inner_text()
+        data,filename=export_bytes(target);events=parsed_calendar(data)
+        target_item=read_bookings(target)[20]
+        assert len(events)==1
+        assert events[0].decoded('DTSTART')==datetime.fromtimestamp(target_item['start']/1000,timezone.utc)
+        assert str(events[0]['SUMMARY'])=='予約あり'
+        assert target_item['name'].encode() not in data and target_item['email'].encode() not in data
+        assert filename=='reservation-2026-06-29.ics'
+        target.locator('#cancelled-tab').click()
+        assert target.locator('#reservation-list .ics-export-button').count()==0
+    run_booking_test('STEP7 2ページ目のICS個別出力・初期匿名設定・履歴ボタンなし',individual_ics)
+
+    def ics_text(target, _):
+        seed(target,1)
+        name='日本語🙂,;\\\r\nBEGIN:VEVENT\n'+'長い名前'*15
+        target.evaluate('name=>{const items=BookingStorage.read();items[0].name=name;BookingStorage.write(items);reloadReservations();}',name)
+        export_open(target,'ics',names=True)
+        data,_=export_bytes(target);events=parsed_calendar(data)
+        assert len(events)==1
+        assert str(events[0]['SUMMARY'])=='予約: '+name.replace('\r\n','\n')
+        assert b'\r\n ' in data
+        unfolded=re.sub(r'\r\n[ \t]','',data.decode())
+        assert '\\,' in unfolded and '\\;' in unfolded and '\\\\' in unfolded and '\\n' in unfolded
+        assert data.decode().count('BEGIN:VEVENT')==2  # 本物1件＋SUMMARY内のエスケープ済み文字列
+        assert events[0].decoded('DTSTART').utcoffset()==timedelta(0)
+    run_booking_test('STEP7 ICSの日本語/絵文字・TEXTエスケープ・CRLF・75オクテット折返し',ics_text)
+
+    def stable_change_cancel(target, _):
+        optional_book(target)
+        export_open(target,'ics',individual=True)
+        first,_=export_bytes(target);before=parsed_calendar(first)[0]
+        export_open(target,'ics',individual=True)
+        again,_=export_bytes(target)
+        assert str(parsed_calendar(again)[0]['UID'])==str(before['UID'])
+        start_change(target)
+        target.locator('#reschedule-external-ack').check()
+        target.locator('#confirm-reschedule').click()
+        export_open(target,'ics',individual=True)
+        changed,_=export_bytes(target);after=parsed_calendar(changed)[0]
+        assert str(after['UID'])==str(before['UID'])
+        assert after.decoded('DTSTART')-before.decoded('DTSTART')==timedelta(hours=1)
+        target.locator('#reservation-list .cancel-reservation-button').click()
+        target.locator('#confirm-cancel').click()
+        export_open(target,'ics')
+        assert '対象 0件' in target.locator('#export-summary').inner_text()
+        assert target.locator('#confirm-export').is_disabled()
+        assert '自動削除されません' in target.locator('#export-dialog').inner_text()
+        target.locator('#dismiss-export').click()
+        assert read_bookings(target)[0]['status']=='cancelled'
+    run_booking_test('STEP7 同一予約の再出力/日時変更のUID安定・キャンセル後の除外',stable_change_cancel)
+
+    def ics_private_id(target, _):
+        seed(target,1)
+        target.evaluate("""()=>{const items=BookingStorage.read();items[0].id='private@example.com';BookingStorage.write(items);reloadReservations();}""")
+        export_open(target,'ics')
+        data,_=export_bytes(target)
+        assert b'private@example.com' not in data
+        assert b'Hanako@Example.COM' not in data
+        assert str(parsed_calendar(data)[0]['SUMMARY'])=='予約あり'
+    run_booking_test('STEP7 ICS UIDにID内のメール等を平文で含めない',ics_private_id)
+
+    for format in ['csv','ics']:
+        def zero_export(target, _, format=format):
+            raw=target.evaluate('localStorage.getItem(BookingStorage.key)')
+            export_open(target,format)
+            assert target.locator('#confirm-export').is_disabled()
+            assert '0件' in target.locator('#export-zero').inner_text()
+            target.locator('#export-dialog').press('Escape')
+            assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+        run_booking_test(f'STEP7 {format}0件は案内してファイルを生成しない',zero_export)
+
+    for format in ['csv','ics']:
+        for failure in ['corrupt','version','denied']:
+            def bad_export_data(target, _, format=format,failure=failure):
+                seed(target,1)
+                if failure=='denied': target.evaluate("() => {Storage.prototype.getItem=()=>{throw Error('denied');};}")
+                else: target.evaluate('raw=>localStorage.setItem(BookingStorage.key,raw)','invalid' if failure=='corrupt' else '{"version":2,"reservations":[]}')
+                target.locator('#csv-export' if format=='csv' else '#ics-export-all').click()
+                assert '出力できません' in target.locator('#export-status').inner_text()
+                assert not target.locator('#export-dialog').evaluate('(e)=>e.open')
+                if failure!='denied':
+                    assert target.evaluate('localStorage.getItem(BookingStorage.key)')==('invalid' if failure=='corrupt' else '{"version":2,"reservations":[]}')
+            run_booking_test(f'STEP7 古い画面データで{format}出力しない {failure}',bad_export_data)
+
+    for format in ['csv','ics']:
+        def fresh_export(target, _, format=format):
+            seed(target,1)
+            export_open(target,format)
+            target.evaluate("""()=>{
+                const items=BookingStorage.read();items.push({...items[0],id:'new',name:'最新予約',...Calendar.slotRange(displayedMonday,4)});BookingStorage.write(items);
+                window.createdURLs=0;window.nativeURL=URL.createObjectURL;URL.createObjectURL=(blob)=>{createdURLs++;return nativeURL(blob);};
+            }""")
+            raw=target.evaluate('localStorage.getItem(BookingStorage.key)')
+            target.locator('#confirm-export').click()
+            target.wait_for_function('document.getElementById("export-error").textContent.includes("保存データが変わりました")')
+            assert target.evaluate('createdURLs')==0
+            assert '対象 2件' in target.locator('#export-summary').inner_text()
+            data,_=export_bytes(target)
+            assert len(csv_rows(data))-1==2 if format=='csv' else len(parsed_calendar(data))==2
+            assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+        run_booking_test(f'STEP7 {format}実行直前に最新データ再取得・件数変更なら再確認',fresh_export)
+
+    def digest_race(target, _):
+        seed(target,1)
+        export_open(target,'ics')
+        target.evaluate("""()=>{
+            window.nativeDigest=crypto.subtle.digest.bind(crypto.subtle);
+            crypto.subtle.digest=(...args)=>new Promise(resolve=>{window.completeDigest=async()=>resolve(await nativeDigest(...args));});
+            window.createdURLs=0;window.nativeURL=URL.createObjectURL;URL.createObjectURL=blob=>{createdURLs++;return nativeURL(blob);};
+        }""")
+        target.locator('#confirm-export').click()
+        target.wait_for_function('Boolean(window.completeDigest)')
+        target.evaluate("""async()=>{
+            const items=BookingStorage.read();Object.assign(items[0],Calendar.slotRange(displayedMonday,8));BookingStorage.write(items);
+            crypto.subtle.digest=nativeDigest;await completeDigest();
+        }""")
+        target.wait_for_function('document.getElementById("export-error").textContent.includes("生成中")')
+        assert target.evaluate('createdURLs')==0
+        raw=target.evaluate('localStorage.getItem(BookingStorage.key)')
+        data,_=export_bytes(target)
+        assert parsed_calendar(data)[0].decoded('DTSTART')==datetime(2026,6,29,4,tzinfo=timezone.utc)
+        assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+    run_booking_test('STEP7 ICS非同期生成中の予約変更で古い内容をダウンロードしない',digest_race)
+
+    def download_error(target, _):
+        seed(target,1)
+        export_open(target,'csv')
+        raw=target.evaluate('localStorage.getItem(BookingStorage.key)')
+        target.evaluate("() => {window.nativeURL=URL.createObjectURL;URL.createObjectURL=()=>{throw Error('download failed');};}")
+        target.locator('#confirm-export').click()
+        target.wait_for_function('document.getElementById("export-error").textContent.includes("download failed")')
+        assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+        assert target.locator('#confirm-export').is_enabled()
+        target.evaluate('()=>{URL.createObjectURL=nativeURL;}')
+        data,_=export_bytes(target)
+        assert len(csv_rows(data))==2
+    run_booking_test('STEP7 ダウンロード生成失敗の案内・保存保護・再試行',download_error)
+
+    def object_url_release(target, _):
+        seed(target,1)
+        target.evaluate("""()=>{
+            window.nativeRevoke=URL.revokeObjectURL;window.revokedURLs=[];
+            URL.revokeObjectURL=url=>{revokedURLs.push(url);nativeRevoke(url);};
+        }""")
+        export_open(target,'csv');export_bytes(target)
+        assert target.evaluate('revokedURLs.length')==0
+        target.clock.run_for(60000)
+        assert target.evaluate('revokedURLs.length')==1
+        export_open(target,'ics');export_bytes(target)
+        target.evaluate("window.dispatchEvent(new PageTransitionEvent('pagehide'))")
+        assert target.evaluate('revokedURLs.length')==2
+    run_booking_test('STEP7 Object URLをダウンロード猶予後・ページ離脱時に解放',object_url_release)
+
+    def export_layout_keyboard(target, _):
+        raw=seed(target,1)
+        payload='<img src=x onerror=window.exportXSS=true>'+'A'*50
+        target.evaluate('name=>{const items=BookingStorage.read();items[0].name=name;BookingStorage.write(items);reloadReservations();}',payload)
+        raw=target.evaluate('localStorage.getItem(BookingStorage.key)')
+        for width in [1440,390]:
+            target.set_viewport_size({'width':width,'height':1000})
+            target.locator('#csv-export').press('Enter')
+            assert target.locator('#export-dialog').evaluate('(e)=>e.open')
+            assert '対象 1件' in target.locator('#export-summary').inner_text()
+            assert target.evaluate('document.documentElement.scrollWidth<=innerWidth')
+            assert target.locator('#export-dialog').evaluate('(e)=>e.scrollWidth<=e.clientWidth')
+            if os.environ.get('TEST_ARTIFACT_DIR'):
+                target.screenshot(path=str(Path(os.environ['TEST_ARTIFACT_DIR'])/f'step7-export-{width}.png'))
+            target.locator('#export-dialog').press('Escape')
+            assert_focus(target,'#csv-export')
+            assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+            target.locator('#ics-include-names').focus();target.locator('#ics-include-names').press('Space')
+            export_open(target,'ics',names=True)
+            data,_=export_bytes(target)
+            assert str(parsed_calendar(data)[0]['SUMMARY'])=='予約: '+payload
+            assert target.locator('#export-dialog img').count()==0
+            assert target.evaluate('window.exportXSS===undefined')
+        assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+    run_booking_test('STEP7 1440px/390px・キーボード/Esc/フォーカス・XSS・保存不変',export_layout_keyboard)
+
+    for format in ['csv','ics']:
+        def export_confirm_error(target, _, format=format):
+            seed(target,1)
+            export_open(target,format)
+            target.evaluate("""() => {
+                window.exportURLs=0;
+                URL.createObjectURL=()=>{window.exportURLs++;throw new Error('unexpected download')};
+                localStorage.setItem(BookingStorage.key,'corrupt after preview');
+            }""")
+            target.locator('#confirm-export').click()
+            target.wait_for_function("document.getElementById('export-error').textContent.includes('出力できません')")
+            assert target.evaluate('window.exportURLs')==0
+            assert target.evaluate('localStorage.getItem(BookingStorage.key)')=='corrupt after preview'
+        run_booking_test(f'STEP7 {format}確認後の保存データ異常でも出力停止',export_confirm_error)
+
+    def export_cancelled_individual(target, _):
+        seed(target,1)
+        export_open(target,'ics',individual=True)
+        target.evaluate("""() => {
+            const items=BookingStorage.read();
+            items[0].status='cancelled';items[0].cancelledAt=Date.now();
+            BookingStorage.write(items);
+            window.exportURLs=0;URL.createObjectURL=()=>{window.exportURLs++;throw new Error('unexpected download')};
+        }""")
+        raw=target.evaluate('localStorage.getItem(BookingStorage.key)')
+        target.locator('#confirm-export').click()
+        assert '0件' in target.locator('#export-zero').inner_text()
+        assert target.locator('#confirm-export').is_disabled()
+        assert target.evaluate('window.exportURLs')==0
+        assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+    run_booking_test('STEP7 個別ICS確認後のキャンセルは最新状態で出力除外',export_cancelled_individual)
 
     print(json.dumps({'sample_events': len(events), 'browser_errors': errors, 'passed': len(passed), 'failed': len(failures), 'test_groups': passed, 'failures': failures}, ensure_ascii=False))
     assert not failures, failures

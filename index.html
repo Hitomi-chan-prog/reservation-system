@@ -10,6 +10,8 @@
     <script src="js/reservations.js" defer></script>
     <script src="js/storage.js" defer></script>
     <script src="js/reservation-list.js" defer></script>
+    <script src="js/export.js" defer></script>
+    <script src="js/export-ui.js" defer></script>
     <script src="js/app.js" defer></script>
   </head>
   <body>
@@ -59,7 +61,7 @@
               </h2>
               <p class="description">緑の空き枠をクリックすると、予約入力画面が開きます。</p>
             </div>
-            <span class="demo-label">STEP 6 / LOCAL</span>
+            <span class="demo-label">STEP 7 / LOCAL</span>
           </div>
           <section id="reschedule-mode" class="reschedule-mode" aria-labelledby="reschedule-mode-heading" hidden>
             <h3 id="reschedule-mode-heading">日時変更モード：変更先の空き枠を選択してください</h3>
@@ -118,7 +120,27 @@
     <label for="booking-date">予約日（日本時間・履歴は元の予約日）</label>
     <input id="booking-date" type="date">
     <button id="booking-clear-date" class="button" type="button">日付をクリア</button>
-    </div><div id="reservation-panel" role="tabpanel" aria-labelledby="confirmed-tab"><div id="reservation-list"></div></div><nav class="pagination" aria-label="予約一覧のページ切り替え">
+    </div>
+              <section class="export-controls" aria-labelledby="export-heading">
+                <h3 id="export-heading">予約データの出力</h3>
+                <p>検索条件・表示ページに関係なく、選んだ対象の全件を出力します。次の確認画面で件数を確認できます。</p>
+                <label for="csv-scope">CSVの出力対象</label>
+                <select id="csv-scope">
+                  <option value="confirmed">確定予約のみ</option>
+                  <option value="cancelled">キャンセル履歴のみ</option>
+                  <option value="all">すべての予約</option>
+                </select>
+                <button id="csv-export" class="button" type="button">CSV出力</button>
+                <label class="acknowledgement" for="ics-include-names">
+                  <input id="ics-include-names" type="checkbox">
+                  <span>ICSの予定名に氏名を含める（一括・個別共通）</span>
+                </label>
+                <button id="ics-export-all" class="button" type="button">ICS一括出力</button>
+                <p>CSVは氏名・メールを含みます。ICSは確定予約のみで、メールは出力しません。出力ファイルの共有・保管にご注意ください。</p>
+                <p>ICSは自動同期ではありません。再取り込み時の更新・重複排除はアプリによって異なります。キャンセルしても、外部カレンダーへ取り込んだ予定は自動削除されません。</p>
+                <p id="export-status" role="status"></p>
+              </section>
+<div id="reservation-panel" role="tabpanel" aria-labelledby="confirmed-tab"><div id="reservation-list"></div></div><nav class="pagination" aria-label="予約一覧のページ切り替え">
     <p id="booking-range" role="status"></p><div>
     <button id="booking-previous" class="button" type="button">前のページ</button>
     <span id="booking-page"></span>
@@ -162,6 +184,18 @@
         <span>ローカルデモ · 予約はこのブラウザに保存されます</span>
       </footer>
     </div>
+    <dialog id="export-dialog" aria-labelledby="export-dialog-heading">
+      <h2 id="export-dialog-heading">出力内容の確認</h2>
+      <p id="export-summary" class="selected-slot"></p>
+      <p id="export-privacy" class="external-warning"></p>
+      <p>ICSは自動同期ではありません。再取り込みによる更新・重複排除は保証しません。キャンセル済みの予定も外部カレンダーから自動削除されません。</p>
+      <p id="export-zero" role="status"></p>
+      <p id="export-error" class="error-message" role="alert"></p>
+      <div class="dialog-actions">
+        <button id="dismiss-export" class="button" type="button">出力をやめる</button>
+        <button id="confirm-export" class="button primary" type="button">ダウンロードする</button>
+      </div>
+    </dialog>
     <dialog id="reservation-dialog" aria-labelledby="dialog-heading">
       <form id="booking-form" novalidate>
         <div class="dialog-heading">
