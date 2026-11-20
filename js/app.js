@@ -182,6 +182,7 @@ function renderReservations() {
         const actions = createTextElement("div", "", "card-actions");
         const cancel = createTextElement("button", "キャンセル", "button");
         cancel.type = "button";
+        cancel.classList.add('cancel-reservation-button');
         cancel.addEventListener('click', () => {
           cancelId = reservation.id;
           byId('cancel-detail').textContent = `${bookingLabel(reservation)} / ${reservation.name} / ${reservation.email}`;
@@ -192,7 +193,10 @@ function renderReservations() {
         change.type = 'button';
         change.dataset.reservationId = reservation.id;
         change.addEventListener('click', () => startReschedule(reservation.id));
-        actions.append(change, cancel);
+        const exportICS = createTextElement('button', 'ICS出力', 'button ics-export-button');
+        exportICS.type = 'button';
+        exportICS.addEventListener('click', () => ExportUI.open('ics', reservation.id, exportICS));
+        actions.append(change, cancel, exportICS);
         card.append(actions);
       }
       if (reservation.status === 'cancelled') {

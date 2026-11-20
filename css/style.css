@@ -782,3 +782,10 @@ button:disabled { opacity: .5; cursor: default; }
 dialog .acknowledgement { display: flex; align-items: flex-start; gap: 9px; color: var(--ink); line-height: 1.7; margin: 10px 0 0; }
 dialog .acknowledgement input { width: 18px; height: 18px; flex: 0 0 18px; margin: 3px 0 0; accent-color: var(--accent); }
 .acknowledgement span { min-width: 0; overflow-wrap: anywhere; }
+
+.export-controls { border: 1px solid var(--line); background: #f5f0e2; padding: 12px; margin: 16px 0; display: grid; gap: 10px; min-width: 0; font-size: 11px; overflow-wrap: anywhere; }
+.export-controls h3 { font-size: 13px; }
+.export-controls select { width: 100%; min-width: 0; padding: 7px; background: #fffdf7; color: var(--ink); border: 1px solid var(--line); font: inherit; }
+.export-controls .acknowledgement { display: flex; align-items: flex-start; gap: 8px; }
+.export-controls input[type="checkbox"] { flex: 0 0 18px; width: 18px; height: 18px; accent-color: var(--accent); }
+#export-dialog { overflow-wrap: anywhere; font-size: 12px; }
