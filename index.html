@@ -12,6 +12,8 @@
     <script src="js/reservation-list.js" defer></script>
     <script src="js/export.js" defer></script>
     <script src="js/export-ui.js" defer></script>
+    <script src="js/backup.js" defer></script>
+    <script src="js/backup-ui.js" defer></script>
     <script src="js/app.js" defer></script>
   </head>
   <body>
@@ -61,7 +63,7 @@
               </h2>
               <p class="description">緑の空き枠をクリックすると、予約入力画面が開きます。</p>
             </div>
-            <span class="demo-label">STEP 7 / LOCAL</span>
+            <span class="demo-label">STEP 8 / LOCAL</span>
           </div>
           <section id="reschedule-mode" class="reschedule-mode" aria-labelledby="reschedule-mode-heading" hidden>
             <h3 id="reschedule-mode-heading">日時変更モード：変更先の空き枠を選択してください</h3>
@@ -161,6 +163,17 @@
           </h2>
           <p class="admin-warning">アクセス制限のないデモ画面です。管理者認証は実装されていません。</p>
           <p>ローカルデモ・認証なし。このブラウザに保存された全予約を日時順に表示します。</p>
+          <section class="backup-controls" aria-labelledby="backup-heading">
+            <h3 id="backup-heading">JSONバックアップ・復元</h3>
+            <p>CSVは閲覧・集計、ICSは外部カレンダー用です。JSONはこのシステムの全予約・キャンセル履歴の保存と復元に使います。</p>
+            <p>氏名・メールアドレスを含む個人情報です。安全な場所に保管し、第三者に共有しないでください。自動バックアップは行いません。</p>
+            <p data-backup-size-note></p>
+            <div class="backup-actions">
+              <button id="save-backup" class="button" type="button">バックアップを保存</button>
+              <button id="open-restore" class="button" type="button">バックアップから復元</button>
+            </div>
+            <p id="backup-status" role="status"></p>
+          </section>
           <p id="admin-storage-error" class="error-message" role="alert"></p>
           <p id="admin-reservation-count" class="description"></p>
           <div class="list-controls">
@@ -184,6 +197,40 @@
         <span>ローカルデモ · 予約はこのブラウザに保存されます</span>
       </footer>
     </div>
+    <dialog id="backup-dialog" aria-labelledby="backup-dialog-heading" aria-describedby="backup-privacy">
+      <h2 id="backup-dialog-heading">JSONバックアップを保存</h2>
+      <p id="backup-count" class="selected-slot"></p>
+      <p id="backup-privacy" class="external-warning">氏名・メールアドレスなどの個人情報が含まれます。共有先・保存先に注意してください。検索・表示ページに関係なく全件を出力します。</p>
+      <p>読み込んだICS予定や確認チェックの状態は含めません。0件でも空のバックアップを保存できます。</p>
+      <p data-backup-size-note></p>
+      <p id="backup-error" class="error-message" role="alert"></p>
+      <div class="dialog-actions">
+        <button id="dismiss-backup" class="button" type="button">保存をやめる</button>
+        <button id="confirm-backup" class="button primary" type="button">JSONをダウンロードする</button>
+      </div>
+    </dialog>
+    <dialog id="restore-dialog" aria-labelledby="restore-dialog-heading" aria-describedby="restore-description">
+      <h2 id="restore-dialog-heading">JSONバックアップから復元</h2>
+      <p id="restore-description">予約データ全体を復元します。追加・統合はしません。氏名・メールを含むファイルは安全に取り扱ってください。</p>
+      <label for="restore-file">復元するJSONバックアップ</label>
+      <input id="restore-file" type="file" accept=".json,application/json" aria-describedby="restore-size-note">
+      <p id="restore-size-note" data-backup-size-note></p>
+      <p id="restore-current"></p>
+      <p id="restore-count" class="selected-slot" role="status"></p>
+      <div id="restore-replace-warning" class="external-warning" hidden>
+        <p>現在の予約データをすべて置き換えます。元に戻すには現在のデータのバックアップが必要です。確定前に中止して「バックアップを保存」から取得してください。</p>
+        <label class="acknowledgement" for="restore-replace-ack">
+          <input id="restore-replace-ack" type="checkbox">
+          <span>必要なバックアップを取得しました。現在の予約データをすべて置き換えることを確認しました。</span>
+        </label>
+      </div>
+      <p>ICS予定・読み込み状態・同意チェックは復元しません。現在読み込み済みのICSがある場合はそのままです。復元後に一覧・履歴・カレンダーを確認してください。</p>
+      <p id="restore-error" class="error-message" role="alert"></p>
+      <div class="dialog-actions">
+        <button id="dismiss-restore" class="button" type="button">復元をやめる</button>
+        <button id="confirm-restore" class="button primary" type="button" disabled>復元を確定する</button>
+      </div>
+    </dialog>
     <dialog id="export-dialog" aria-labelledby="export-dialog-heading">
       <h2 id="export-dialog-heading">出力内容の確認</h2>
       <p id="export-summary" class="selected-slot"></p>

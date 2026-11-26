@@ -5,12 +5,15 @@ window.Reservations = (() => {
   function input(name, email) {
     if (typeof name !== 'string' || typeof email !== 'string') fail('氏名とメールアドレスを入力してください。');
     name = name.trim();
+    // 100コードポイントは最大200 UTF-16コード単位。配列化する前に大きすぎる値を拒否する。
+    if (!name || name.length > 200 || Array.from(name).length > 100) fail('氏名は前後の空白を除いて1〜100文字で入力してください。');
     email = email.trim();
-    if (Array.from(name).length < 1 || Array.from(name).length > 100) fail('氏名は前後の空白を除いて1〜100文字で入力してください。');
+    // 巨大な値をDOMのemail入力へ設定する前に長さを調べる。
+    if (!email || email.length > 254 || /[\r\n]/.test(email)) fail('メールアドレスは254文字以内の正しい形式で入力してください。');
     const emailInput = document.createElement('input');
     emailInput.type = 'email';
     emailInput.value = email;
-    if (!email || email.length > 254 || /[\r\n]/.test(email) || !emailInput.validity.valid) fail('メールアドレスは254文字以内の正しい形式で入力してください。');
+    if (!emailInput.validity.valid) fail('メールアドレスは254文字以内の正しい形式で入力してください。');
     return { name, email };
   }
   function validRange(start, end) {
