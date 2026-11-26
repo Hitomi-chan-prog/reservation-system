@@ -2325,6 +2325,518 @@ with sync_playwright() as p:
         assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
     run_booking_test('STEP7 個別ICS確認後のキャンセルは最新状態で出力除外',export_cancelled_individual)
 
+
+    # STEP 8: 実ダウンロード・厳密な全件検証・置き換え・保存不変と競合。
+    def backup_document(items):
+        return {'format':'reservation-ledger.backup','backupVersion':1,'exportedAt':'2026-06-29T00:00:00.000Z',
+                'reservationCount':len(items),'data':{'version':1,'reservations':items}}
+
+    def admin_backup(target):
+        target.evaluate("location.hash='admin'")
+        target.locator('#admin-view').wait_for(state='visible')
+
+    def restore_file(target, document, wait=True, name='backup.json'):
+        admin_backup(target)
+        if not target.locator('#restore-dialog').evaluate('(e)=>e.open'):
+            target.locator('#open-restore').click()
+        source=document if isinstance(document,str) else json.dumps(document,ensure_ascii=False)
+        target.locator('#restore-file').set_input_files({'name':name,'mimeType':'application/json','buffer':source.encode('utf-8')})
+        if wait:
+            target.wait_for_function("document.getElementById('restore-count').textContent.includes('検証済み') || Boolean(document.getElementById('restore-error').textContent)")
+
+    def write_count(target):
+        target.evaluate("""()=>{window.realSetItem=Storage.prototype.setItem;window.backupWrites=0;
+          Storage.prototype.setItem=function(key,value){if(key===BookingStorage.key)window.backupWrites++;return realSetItem.call(this,key,value)};}""")
+
+    for count in [0,41]:
+        def backup_download(target, _, count=count):
+            if count: seed(target,count)
+            original=read_bookings(target);raw=target.evaluate('localStorage.getItem(BookingStorage.key)')
+            load_ics(target)
+            admin_backup(target)
+            target.locator('#admin-search').fill('存在しない')
+            target.locator('#save-backup').click()
+            assert f'全予約 {len(original)}件' in target.locator('#backup-count').inner_text()
+            assert '個人情報' in target.locator('#backup-privacy').inner_text()
+            target.evaluate("()=>{window.nativeObjectURL=URL.createObjectURL;URL.createObjectURL=blob=>{window.backupMime=blob.type;return nativeObjectURL(blob)}}")
+            with target.expect_download() as pending: target.locator('#confirm-backup').click()
+            dl=pending.value;assert dl.failure() is None
+            data=Path(dl.path()).read_bytes();doc=json.loads(data.decode('utf-8'))
+            assert doc==backup_document(original)
+            assert set(doc)=={'format','backupVersion','exportedAt','reservationCount','data'}
+            assert doc['data']['reservations']==original
+            assert target.evaluate('backupMime')=='application/json;charset=utf-8'
+            assert dl.suggested_filename=='reservation-backup-2026-06-29.json'
+            assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+            assert_focus(target,'#save-backup')
+            assert target.locator('#admin-search').input_value()=='存在しない'
+        run_booking_test(f'STEP8 JSON実ファイル・全予約/日本語/形式/日時/件数・保存不変 {count}件',backup_download)
+
+    def restore_empty(target, _):
+        seed(target,3);items=read_bookings(target)
+        # 過去の確定予約も、通常登録の過去日時チェックとは切り離して保持する。
+        items[0]['start']-=7*86400000;items[0]['end']-=7*86400000
+        target.evaluate('localStorage.removeItem(BookingStorage.key);reloadReservations()')
+        raw=target.evaluate('localStorage.getItem(BookingStorage.key)')
+        restore_file(target,backup_document(items))
+        assert '0件' in target.locator('#restore-current').inner_text()
+        assert target.locator('#restore-replace-warning').is_hidden()
+        assert target.locator('#confirm-restore').is_enabled()
+        assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+        write_count(target);target.locator('#confirm-restore').click()
+        assert target.evaluate('backupWrites')==1
+        assert read_bookings(target)==items
+        stored=target.evaluate('JSON.parse(localStorage.getItem(BookingStorage.key))')
+        assert set(stored)=={'version','reservations'} and stored['version']==1
+        assert '復元しました' in target.locator('#backup-status').inner_text()
+        assert_focus(target,'#open-restore')
+        assert '全4件' in target.locator('#admin-range').inner_text()
+        assert target.locator('#calendar-body td.reserved').count()==2
+        target.reload();assert read_bookings(target)==items
+        assert target.locator('#admin-reservation-list .reservation-card').count()==4
+        assert target.evaluate('icsStatus()')=='unloaded'
+        target.evaluate("location.hash='booking'");target.locator('#booking-view').wait_for(state='visible')
+        open_booking(target,6)
+        assert target.locator('#confirm-booking').is_disabled()
+        target.locator('#booking-external-ack').check();target.locator('#confirm-booking').click()
+        assert len(read_bookings(target))==5
+    run_booking_test('STEP8 空へ復元・過去/履歴・setItem1回・一覧/暦/再読込・ICS任意同意',restore_empty)
+
+    def replace_confirm(target, _):
+        seed(target,1);replacement=read_bookings(target)
+        replacement[0]['id']='replacement';replacement[0]['name']='置き換え済み'
+        seed(target,41)
+        admin_backup(target);target.locator('#admin-next').click();target.locator('#admin-next').click()
+        raw=target.evaluate('localStorage.getItem(BookingStorage.key)')
+        restore_file(target,backup_document(replacement))
+        assert '42件' in target.locator('#restore-current').inner_text()
+        assert '2件' in target.locator('#restore-count').inner_text()
+        assert 'すべて置き換え' in target.locator('#restore-replace-warning').inner_text()
+        assert target.locator('#confirm-restore').is_disabled()
+        target.locator('#confirm-restore').dispatch_event('click')
+        assert '確認チェック' in target.locator('#restore-error').inner_text()
+        assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+        target.locator('#restore-replace-ack').check();write_count(target)
+        target.locator('#confirm-restore').click()
+        assert target.evaluate('backupWrites')==1 and read_bookings(target)==replacement
+        assert target.locator('#admin-page').inner_text()=='1 / 1ページ'
+        assert '置き換え済み' in target.locator('#admin-reservation-list').inner_text()
+    run_booking_test('STEP8 既存42件・専用確認なし拒否・全置換・ページ補正',replace_confirm)
+
+    for action in ['escape','dismiss','reopen']:
+        def restore_cancel(target, _, action=action):
+            raw=seed(target,1);doc=backup_document(read_bookings(target))
+            restore_file(target,doc);target.locator('#restore-replace-ack').check()
+            target.evaluate("()=>{window.noDownload=0;URL.createObjectURL=()=>{window.noDownload++;throw Error('unexpected')}}")
+            if action=='escape':target.locator('#restore-dialog').press('Escape')
+            else:target.locator('#dismiss-restore').click()
+            assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+            assert target.evaluate('noDownload')==0
+            assert_focus(target,'#open-restore')
+            if action=='reopen':
+                restore_file(target,doc)
+                assert not target.locator('#restore-replace-ack').is_checked()
+                assert target.locator('#confirm-restore').is_disabled()
+        run_booking_test(f'STEP8 復元中止/確認リセット・保存不変 {action}',restore_cancel)
+
+    invalid_cases=['json','format','backupVersion','storageVersion','array','count','exportedAt','outerExtra','itemExtra',
+                   'duplicateID','duplicateSlot','startType','range','weekday','status','cancelledAt','confirmedCancel','createdAt','name','email','nullItem']
+    for case in invalid_cases:
+        def invalid_backup(target, _, case=case):
+            raw=seed(target,3);doc=backup_document(read_bookings(target));items=doc['data']['reservations'];one=items[0]
+            if case=='json':doc='{invalid'
+            elif case=='format':doc['format']='other'
+            elif case=='backupVersion':doc['backupVersion']=2
+            elif case=='storageVersion':doc['data']['version']=2
+            elif case=='array':doc['data']['reservations']={}
+            elif case=='count':doc['reservationCount']+=1
+            elif case=='exportedAt':doc['exportedAt']='not-a-date'
+            elif case=='outerExtra':doc['ics']='must not restore'
+            elif case=='itemExtra':one['unexpected']='secret'
+            elif case=='duplicateID':items[1]['id']=one['id']
+            elif case=='duplicateSlot':items[1]['start']=one['start'];items[1]['end']=one['end']
+            elif case=='startType':one['start']=str(one['start'])
+            elif case=='range':one['end']+=60000
+            elif case=='weekday':one['start']-=86400000;one['end']-=86400000
+            elif case=='status':one['status']='invalid'
+            elif case=='cancelledAt':items[-1]['cancelledAt']=None
+            elif case=='confirmedCancel':one['cancelledAt']=one['start']
+            elif case=='createdAt':one['createdAt']=one['start']+1
+            elif case=='name':one['name']=' '
+            elif case=='email':one['email']='not-an-email'
+            elif case=='nullItem':items[1]=None
+            restore_file(target,doc)
+            assert target.locator('#restore-error').inner_text()
+            assert target.locator('#confirm-restore').is_disabled()
+            target.locator('#confirm-restore').dispatch_event('click')
+            assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+        run_booking_test(f'STEP8 不正1件でも全体拒否・保存不変 {case}',invalid_backup)
+
+    def restore_failure(target, _):
+        raw=seed(target,1);doc=backup_document(read_bookings(target));doc['data']['reservations'][0]['name']='新しい名前'
+        restore_file(target,doc);target.locator('#restore-replace-ack').check()
+        target.evaluate("()=>{window.originalSet=Storage.prototype.setItem;Storage.prototype.setItem=()=>{throw Error('quota')}}")
+        target.locator('#confirm-restore').click()
+        assert '保存できません' in target.locator('#restore-error').inner_text()
+        assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+        assert '復元しました' not in target.locator('#backup-status').inner_text()
+        target.evaluate('()=>{Storage.prototype.setItem=originalSet}')
+        target.locator('#confirm-restore').click()
+        assert read_bookings(target)[0]['name']=='新しい名前'
+    run_booking_test('STEP8 保存失敗は元データ保持・成功表示なし・再試行',restore_failure)
+
+    for action in ['add','change','cancel']:
+        def restore_other_tab(target, isolated, action=action):
+            seed(target,1);restore_file(target,backup_document(read_bookings(target)));target.locator('#restore-replace-ack').check()
+            other=isolated.new_page();other.goto(url)
+            other.evaluate("""action=>{const items=BookingStorage.read();
+              if(action==='add')items.push({...items[0],id:'another',...Calendar.slotRange(displayedMonday,6)});
+              if(action==='change')items[0].name='別タブ変更';
+              if(action==='cancel'){items[0].status='cancelled';items[0].cancelledAt=Date.now();}
+              BookingStorage.write(items);} """,action)
+            target.wait_for_function("document.getElementById('restore-error').textContent.includes('別タブ')")
+            raw=other.evaluate('localStorage.getItem(BookingStorage.key)')
+            assert target.locator('#confirm-restore').is_disabled()
+            assert not target.locator('#restore-replace-ack').is_checked()
+            target.locator('#confirm-restore').dispatch_event('click')
+            assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+        run_booking_test(f'STEP8 復元確認中の実別タブ{action}で停止',restore_other_tab)
+
+    def restore_immediate_change(target, _):
+        seed(target,1);doc=backup_document(read_bookings(target))
+        target.evaluate('localStorage.removeItem(BookingStorage.key)')
+        restore_file(target,doc)
+        # storageイベントが自分のタブに来なくても、直前の実データ照合で拒否。
+        target.evaluate('doc=>BookingStorage.write(doc.data.reservations)',doc)
+        raw=target.evaluate('localStorage.getItem(BookingStorage.key)')
+        target.locator('#confirm-restore').click()
+        assert '保存データが変わりました' in target.locator('#restore-error').inner_text()
+        assert target.locator('#confirm-restore').is_disabled()
+        assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+    run_booking_test('STEP8 空確認後の直前登録も再取得して上書き拒否',restore_immediate_change)
+
+    for action in ['load','error']:
+        def delayed_backup_file(target, _, action=action):
+            raw=seed(target,1);doc=backup_document(read_bookings(target));admin_backup(target);target.locator('#open-restore').click()
+            target.evaluate("""()=>{window.jsonReaders=[];window.aborts=0;window.NativeReader=FileReader;
+              window.FileReader=class{constructor(){jsonReaders.push(this);this.readyState=0}readAsArrayBuffer(){this.readyState=1}abort(){this.readyState=2;aborts++}};}""")
+            restore_file(target,doc,wait=False,name='old.json');restore_file(target,doc,wait=False,name='new.json')
+            assert target.evaluate('aborts')==1
+            target.evaluate("""doc=>{jsonReaders[1].result=new TextEncoder().encode(JSON.stringify(doc)).buffer;jsonReaders[1].readyState=2;jsonReaders[1].onload()}""",doc)
+            assert '検証済み' in target.locator('#restore-count').inner_text()
+            target.evaluate("""action=>{jsonReaders[0].result='{bad';jsonReaders[0].readyState=2;if(action==='load')jsonReaders[0].onload();else jsonReaders[0].onerror()}""",action)
+            assert not target.locator('#restore-error').inner_text()
+            target.locator('#dismiss-restore').click()
+            target.evaluate("()=>{jsonReaders[1].onload();FileReader=NativeReader}")
+            assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+        run_booking_test(f'STEP8 読込中止・再選択・旧世代遅延{action}無視',delayed_backup_file)
+
+    def backup_changed(target, _):
+        seed(target,1);admin_backup(target);target.locator('#save-backup').click()
+        target.evaluate("()=>{const items=BookingStorage.read();items[0].name='変更後';BookingStorage.write(items);window.backupURLs=0;URL.createObjectURL=()=>{backupURLs++;throw Error('unexpected')}}")
+        raw=target.evaluate('localStorage.getItem(BookingStorage.key)')
+        target.locator('#confirm-backup').click()
+        assert '保存データが変わりました' in target.locator('#backup-error').inner_text()
+        assert target.evaluate('backupURLs')==0
+        target.locator('#backup-dialog').press('Escape')
+        assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+        assert_focus(target,'#save-backup')
+    run_booking_test('STEP8 保存確認後の変更は再確認・中止でファイルなし',backup_changed)
+
+    def restored_exports(target, _):
+        seed(target,21);doc=backup_document(read_bookings(target));load_ics(target)
+        target.evaluate('localStorage.removeItem(BookingStorage.key)')
+        restore_file(target,doc);target.locator('#confirm-restore').click()
+        assert target.evaluate('icsStatus()')=='ready' # 現在のICSは保持。ファイルにはICSなし。
+        target.evaluate("location.hash='booking'");target.locator('#booking-view').wait_for(state='visible')
+        target.locator('#booking-next').click();assert target.locator('#reservation-list .reservation-card').count()==1
+        raw=target.evaluate('localStorage.getItem(BookingStorage.key)')
+        export_open(target,'csv',scope='all');data,_=export_bytes(target);assert len(csv_rows(data))==23
+        export_open(target,'ics');data,_=export_bytes(target);assert len(parsed_calendar(data))==21
+        assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+    run_booking_test('STEP8 復元後21件ページ・CSV/ICS全件・現在ICS保持',restored_exports)
+
+    def restore_layout(target, _):
+        seed(target,1);items=read_bookings(target);items[0]['name']='<img src=x onerror=window.backupXSS=true>'+'長'*50
+        doc=backup_document(items);raw=target.evaluate('localStorage.getItem(BookingStorage.key)')
+        for width in [1440,390]:
+            target.set_viewport_size({'width':width,'height':900})
+            restore_file(target,doc,name='<img src=x onerror=window.backupXSS=true>.json')
+            assert target.evaluate('document.documentElement.scrollWidth<=innerWidth')
+            assert target.locator('#restore-dialog').evaluate('(e)=>e.scrollWidth<=e.clientWidth')
+            target.locator('#restore-replace-ack').focus();target.locator('#restore-replace-ack').press('Space')
+            assert target.locator('#confirm-restore').is_enabled()
+            if os.environ.get('TEST_ARTIFACT_DIR'):target.screenshot(path=str(Path(os.environ['TEST_ARTIFACT_DIR'])/f'step8-restore-{width}.png'))
+            target.locator('#restore-dialog').press('Escape');assert_focus(target,'#open-restore')
+            assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+        restore_file(target,doc);target.locator('#restore-replace-ack').check();target.locator('#confirm-restore').press('Enter')
+        assert '<img' in target.locator('#admin-reservation-list').inner_text()
+        assert target.locator('#admin-reservation-list img').count()==0
+        assert target.evaluate('window.backupXSS===undefined')
+        assert_focus(target,'#open-restore')
+    run_booking_test('STEP8 1440/390・長文/XSS・Space/Enter/Esc・フォーカス',restore_layout)
+
+
+    for stage in ['backup-open','backup-confirm','restore-open','restore-confirm']:
+        def backup_read_failure(target, _, stage=stage):
+            raw=seed(target,1);doc=backup_document(read_bookings(target));admin_backup(target)
+            if stage=='backup-confirm':target.locator('#save-backup').click()
+            if stage=='restore-confirm':restore_file(target,doc);target.locator('#restore-replace-ack').check()
+            target.evaluate("()=>{window.oldRead=Storage.prototype.getItem;Storage.prototype.getItem=()=>{throw Error('denied')}}")
+            target.locator({'backup-open':'#save-backup','backup-confirm':'#confirm-backup','restore-open':'#open-restore','restore-confirm':'#confirm-restore'}[stage]).click()
+            selector='#backup-status' if stage.endswith('open') else '#backup-error' if stage.startswith('backup') else '#restore-error'
+            assert 'アクセスできません' in target.locator(selector).inner_text()
+            target.evaluate('()=>{Storage.prototype.getItem=oldRead}')
+            assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+        run_booking_test(f'STEP8 保存領域の読取拒否で停止・元データ保護 {stage}',backup_read_failure)
+
+    for existing in [False,True]:
+        def restore_zero(target, _, existing=existing):
+            if existing:seed(target,1)
+            restore_file(target,backup_document([]))
+            if existing:
+                assert target.locator('#confirm-restore').is_disabled();target.locator('#restore-replace-ack').check()
+            write_count(target);target.locator('#confirm-restore').click()
+            assert read_bookings(target)==[] and target.evaluate('backupWrites')==1
+            assert target.locator('#admin-reservation-list .reservation-card').count()==0
+            assert '0件' in target.locator('#backup-status').inner_text()
+        run_booking_test(f'STEP8 0件の復元・既存ありなら明示確認 existing={existing}',restore_zero)
+
+    def invalid_utf8(target, _):
+        raw=seed(target,1);doc=backup_document(read_bookings(target));source=json.dumps(doc,ensure_ascii=False).encode().replace('山田'.encode(),b'\xff',1)
+        admin_backup(target);target.locator('#open-restore').click()
+        target.locator('#restore-file').set_input_files({'name':'broken.json','mimeType':'application/json','buffer':source})
+        target.wait_for_function("document.getElementById('restore-error').textContent.includes('UTF-8')")
+        assert target.locator('#confirm-restore').is_disabled()
+        assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+        # UTF-8 BOM付きの正常ファイルは受け付ける。
+        restore_file(target,'\ufeff'+json.dumps(doc,ensure_ascii=False))
+        assert '検証済み' in target.locator('#restore-count').inner_text()
+    run_booking_test('STEP8 不正UTF-8は文字置換せず拒否・正常BOMを受理',invalid_utf8)
+
+    def file_error_retry(target, _):
+        raw=seed(target,1);doc=backup_document(read_bookings(target));admin_backup(target);target.locator('#open-restore').click()
+        target.evaluate("()=>{window.actualReader=FileReader;window.FileReader=class{readAsArrayBuffer(){this.onerror()}}}")
+        restore_file(target,doc)
+        assert '読み込めません' in target.locator('#restore-error').inner_text()
+        assert target.locator('#restore-file').input_value()==''
+        target.evaluate('()=>{FileReader=actualReader}')
+        restore_file(target,doc)
+        assert '検証済み' in target.locator('#restore-count').inner_text()
+        assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+    run_booking_test('STEP8 FileReader失敗・同じファイル再選択で復帰',file_error_retry)
+
+    def pending_close(target, _):
+        raw=seed(target,1);doc=backup_document(read_bookings(target));admin_backup(target);target.locator('#open-restore').click()
+        target.evaluate("""()=>{window.actualReader=FileReader;window.fileAbortCount=0;window.FileReader=class{
+          readAsArrayBuffer(){window.waitingJSON=this;this.readyState=1}abort(){this.readyState=2;fileAbortCount++}}}""")
+        restore_file(target,doc,wait=False)
+        target.locator('#restore-dialog').press('Escape')
+        assert target.evaluate('fileAbortCount')==1
+        target.evaluate("doc=>{waitingJSON.result=new TextEncoder().encode(JSON.stringify(doc)).buffer;waitingJSON.onload();FileReader=actualReader}",doc)
+        assert not target.locator('#restore-dialog').evaluate('(e)=>e.open')
+        assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+        restore_file(target,doc)
+        assert target.locator('#confirm-restore').is_disabled()
+    run_booking_test('STEP8 読み込み途中のEsc・abort・遅延完了後も保存なし',pending_close)
+
+    def backup_resources(target, _):
+        raw=seed(target,1);admin_backup(target)
+        target.evaluate("""()=>{window.normalURL=URL.createObjectURL;window.normalRevoke=URL.revokeObjectURL;window.backupRevoked=[];
+          URL.createObjectURL=()=>{throw Error('blob failed')};URL.revokeObjectURL=url=>{backupRevoked.push(url);normalRevoke(url)}}""")
+        target.locator('#save-backup').click();target.locator('#confirm-backup').click()
+        assert 'blob failed' in target.locator('#backup-error').inner_text()
+        assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+        target.evaluate('()=>{URL.createObjectURL=normalURL}')
+        with target.expect_download() as pending:target.locator('#confirm-backup').click()
+        assert pending.value.failure() is None
+        assert target.evaluate('backupRevoked.length')==0
+        target.clock.run_for(60000);assert target.evaluate('backupRevoked.length')==1
+        target.locator('#save-backup').click()
+        with target.expect_download() as pending:target.locator('#confirm-backup').click()
+        assert pending.value.failure() is None
+        target.evaluate("window.dispatchEvent(new PageTransitionEvent('pagehide'))")
+        assert target.evaluate('backupRevoked.length')==2
+        assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+    run_booking_test('STEP8 Blob失敗時保護・再試行・URLを時間/離脱で解放',backup_resources)
+
+    def restore_ics_conflict(target, _):
+        seed(target,1);doc=backup_document(read_bookings(target));target.evaluate('localStorage.removeItem(BookingStorage.key);reloadReservations()')
+        load_ics(target,event('restore-conflict',start='20260629T090000',end='20260629T093000'))
+        restore_file(target,doc);target.locator('#confirm-restore').click()
+        assert read_bookings(target)==doc['data']['reservations']
+        assert '競合' in target.locator('#conflict-warning').inner_text()
+        assert target.evaluate('importedEvents.size')==1
+    run_booking_test('STEP8 現在ICSとの競合は履歴復元を妨げず既存警告へ反映',restore_ics_conflict)
+
+    def reselect_after_conflict(target, isolated):
+        seed(target,1);doc=backup_document(read_bookings(target));restore_file(target,doc);target.locator('#restore-replace-ack').check()
+        other=isolated.new_page();other.goto(url);other.evaluate("()=>{const items=BookingStorage.read();items[0].name='最新';BookingStorage.write(items)}")
+        target.wait_for_function("document.getElementById('restore-error').textContent.includes('別タブ')")
+        assert target.locator('#restore-file').input_value()==''
+        restore_file(target,doc)
+        assert not target.locator('#restore-replace-ack').is_checked()
+        target.locator('#restore-replace-ack').check();target.locator('#confirm-restore').click()
+        assert read_bookings(target)==doc['data']['reservations']
+    run_booking_test('STEP8 競合停止後の同一ファイル再選択・新たな確認で復元',reselect_after_conflict)
+
+    def real_backup_roundtrip(target, _):
+        seed(target,41);original=read_bookings(target);admin_backup(target)
+        target.locator('#admin-next').click()
+        target.locator('#admin-search').fill('該当なし')
+        target.locator('#save-backup').click()
+        with target.expect_download() as pending:target.locator('#confirm-backup').click()
+        downloaded=pending.value
+        assert downloaded.failure() is None
+        data=Path(downloaded.path()).read_bytes()
+        assert json.loads(data)['data']['reservations']==original
+        target.evaluate('localStorage.removeItem(BookingStorage.key)')
+        target.reload()
+        assert read_bookings(target)==[] and target.evaluate('icsStatus()')=='unloaded'
+        target.locator('#open-restore').click()
+        target.locator('#restore-file').set_input_files({'name':downloaded.suggested_filename,'mimeType':'application/json','buffer':data})
+        target.wait_for_function("document.getElementById('restore-count').textContent.includes('検証済み')")
+        # OSファイル選択だけの中止イベントは、外側の復元ダイアログのEscとは区別。
+        target.locator('#restore-file').dispatch_event('cancel')
+        assert target.locator('#restore-dialog').evaluate('(e)=>e.open')
+        assert target.evaluate('localStorage.getItem(BookingStorage.key)') is None
+        target.locator('#confirm-restore').click()
+        assert read_bookings(target)==original
+        target.reload();assert read_bookings(target)==original
+        assert '全42件' in target.locator('#admin-range').inner_text()
+    run_booking_test('STEP8 実バックアップ→保存領域削除→実ファイル復元・選択中止とEscの区別',real_backup_roundtrip)
+
+
+    # STEP 8 Medium修正: UTF-8サイズの共通上限と巨大な文字列の早期拒否。
+    for delta in [-1,0,1]:
+        def json_size_boundary(target, _, delta=delta):
+            raw=seed(target,1);doc=backup_document(read_bookings(target))
+            limit=target.evaluate('ReservationBackup.maxBytes');assert limit==5*1024*1024
+            source=json.dumps(doc,ensure_ascii=False)
+            source+=' '*(limit+delta-len(source.encode('utf-8')))
+            assert len(source.encode('utf-8'))==limit+delta
+            admin_backup(target);target.locator('#open-restore').click()
+            target.evaluate("""()=>{window.ReaderClass=FileReader;window.readerStarts=0;
+              FileReader=class extends ReaderClass{readAsArrayBuffer(f){readerStarts++;return super.readAsArrayBuffer(f)}};}""")
+            restore_file(target,source)
+            if delta<=0:
+                assert '検証済み' in target.locator('#restore-count').inner_text()
+                assert target.evaluate('readerStarts')==1
+                assert not target.locator('#restore-error').inner_text()
+                assert target.locator('#confirm-restore').is_disabled()
+            else:
+                assert '5MiB' in target.locator('#restore-error').inner_text()
+                assert target.evaluate('readerStarts')==0
+                assert target.locator('#confirm-restore').is_disabled()
+                restore_file(target,doc)
+                assert target.evaluate('readerStarts')==1
+                assert '検証済み' in target.locator('#restore-count').inner_text()
+            assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+            target.locator('#restore-dialog').press('Escape');assert_focus(target,'#open-restore')
+        run_booking_test(f'STEP8 Medium UTF-8上限{delta:+}バイト・Reader開始/拒否・復帰・Esc',json_size_boundary)
+
+    for case in ['missing','null','nan','infinity','negative','fraction','string','throws']:
+        def invalid_file_size(target, _, case=case):
+            raw=seed(target,1);admin_backup(target);target.locator('#open-restore').click()
+            target.evaluate("""kind=>{window.startedReaders=0;FileReader=class{constructor(){startedReaders++}};
+              const sizes={null:null,nan:NaN,infinity:Infinity,negative:-1,fraction:0.5,string:'123'};
+              const f={name:'invalid-size.json'};
+              if(kind==='throws')Object.defineProperty(f,'size',{get(){throw Error('not readable')}});
+              else if(kind!=='missing')f.size=sizes[kind];
+              const input=document.getElementById('restore-file');Object.defineProperty(input,'files',{configurable:true,get:()=>[f]});
+              input.dispatchEvent(new Event('change'));}""",case)
+            assert target.evaluate('startedReaders')==0
+            assert 'サイズを確認できません' in target.locator('#restore-error').inner_text()
+            assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+        run_booking_test(f'STEP8 Medium 不正/取得不能なfile.sizeを読み込み前に拒否 {case}',invalid_file_size)
+
+    def guard_direct_parse(target, _):
+        result=target.evaluate("""()=>{const realParse=JSON.parse,realEncode=TextEncoder.prototype.encode;let parses=0,encodes=0,message='';
+          JSON.parse=()=>{parses++;throw Error('unexpected parse')};TextEncoder.prototype.encode=()=>{encodes++;throw Error('unexpected encode')};
+          try{ReservationBackup.parse(' '.repeat(ReservationBackup.maxBytes+1))}catch(e){message=e.message}
+          finally{JSON.parse=realParse;TextEncoder.prototype.encode=realEncode}
+          return {parses,encodes,message};}""")
+        assert result['parses']==0 and result['encodes']==0 and '5MiB' in result['message']
+    run_booking_test('STEP8 Medium 直接parseも巨大な文字列はエンコード/JSON解析前に拒否',guard_direct_parse)
+
+    def reader_size_mismatch(target, _):
+        raw=seed(target,1);doc=backup_document(read_bookings(target));admin_backup(target);target.locator('#open-restore').click()
+        target.evaluate("""()=>{window.decodeCount=0;const decode=TextDecoder.prototype.decode;
+          TextDecoder.prototype.decode=function(...args){decodeCount++;return decode.apply(this,args)};
+          FileReader=class{readAsArrayBuffer(){this.result=new ArrayBuffer(ReservationBackup.maxBytes+1);this.onload()}};}""")
+        restore_file(target,doc)
+        assert '5MiB' in target.locator('#restore-error').inner_text()
+        assert target.evaluate('decodeCount')==0
+        assert target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+    run_booking_test('STEP8 Medium 読み込み結果が上限超過ならデコード前にも拒否',reader_size_mismatch)
+
+    def giant_input_early(target, _):
+        result=target.evaluate("""()=>{const huge='A'.repeat(64*1024*1024);const from=Array.from,create=document.createElement;
+          let hugeArrays=0,inputs=0;const messages=[];
+          Array.from=function(v,...args){if(typeof v==='string'&&v.length>200){hugeArrays++;throw Error('large allocation')}return from.call(this,v,...args)};
+          document.createElement=function(tag,...args){if(tag==='input')inputs++;return create.call(this,tag,...args)};
+          try{for(const [name,email] of [[huge,'a@example.com'],['正常な氏名',huge]]){try{Reservations.input(name,email)}catch(e){messages.push(e.message)}}}
+          finally{Array.from=from;document.createElement=create}
+          return {hugeArrays,inputs,messages};}""")
+        assert result['hugeArrays']==0 and result['inputs']==0
+        assert '氏名' in result['messages'][0] and 'メール' in result['messages'][1]
+    run_booking_test('STEP8 Medium 64MiB文字列を1回だけ生成・氏名の巨大配列/メールDOM設定を回避',giant_input_early)
+
+    for name,valid in [('日'*100,True),('🙂'*100,True),('日'*99+'🙂',True),('A'*101,False),('🙂'*101,False)]:
+        def unicode_input(target, _, name=name, valid=valid):
+            seed(target,1)
+            result=target.evaluate("""name=>{try{const normalized=Reservations.input('  '+name+'  ',' a@example.com ');
+              const items=BookingStorage.read();items[0].name=normalized.name;
+              return {name:ReservationBackup.parse(ReservationBackup.serialize(items))[0].name};}catch(e){return {error:e.message}}}""",name)
+            if valid:assert result['name']==name
+            else:assert '氏名' in result['error']
+        run_booking_test(f'STEP8 Medium 日本語/絵文字のUnicode境界 codepoints={len(name)} UTF16={len(name.encode("utf-16-le"))//2} valid={valid}',unicode_input)
+
+    for length in [254,255]:
+        def email_length(target, _, length=length):
+            email='a'*64+'@'+'b'*63+'.'+'c'*63+'.'+'d'*61
+            if length==255:email='a'+email
+            result=target.evaluate("""email=>{let inputs=0;const create=document.createElement;
+              document.createElement=function(tag,...args){if(tag==='input')inputs++;return create.call(this,tag,...args)};
+              try{return {email:Reservations.input('正常🙂',email).email,inputs}}catch(e){return {error:e.message,inputs}}
+              finally{document.createElement=create}}""",email)
+            if length==254:assert result['email']==email and result['inputs']==1
+            else:assert 'メール' in result['error'] and result['inputs']==0
+        run_booking_test(f'STEP8 Medium メール{length}文字・DOM検証前の上限',email_length)
+
+    def own_backup_size_limit(target, _):
+        seed(target,1)
+        # 正常な予約を一度だけ組み立て、氏名/IDの許容長内で正確なUTF-8サイズに合わせる。
+        expected_count=target.evaluate("""()=>{const base=BookingStorage.read()[0],limit=ReservationBackup.maxBytes;
+          const items=Array.from({length:Math.floor(limit/400)},(_,i)=>({...base,id:'sized-'+i,name:'A',email:'a@example.com',status:'cancelled',cancelledAt:2}));
+          const doc=ReservationBackup.create(items);let remaining=limit-new TextEncoder().encode(JSON.stringify(doc,null,2)).length;
+          if(remaining<0)throw Error('fixture is too large');
+          for(const item of items){let n=Math.min(99,remaining);item.name+='A'.repeat(n);remaining-=n;
+            n=Math.min(100-item.id.length,remaining);item.id+='i'.repeat(n);remaining-=n;if(!remaining)break;}
+          if(remaining)throw Error('fixture cannot reach boundary');
+          const source=ReservationBackup.serialize(items,Date.parse(doc.exportedAt));
+          if(new TextEncoder().encode(source).length!==limit)throw Error('wrong fixture size');
+          BookingStorage.write(items);reloadReservations();return items.length;}""")
+        admin_backup(target);target.locator('#save-backup').click()
+        with target.expect_download() as pending:target.locator('#confirm-backup').click()
+        dl=pending.value;assert dl.failure() is None;data=Path(dl.path()).read_bytes()
+        assert len(data)==target.evaluate('ReservationBackup.maxBytes')
+        expected=json.loads(data)['data']['reservations'];assert len(expected)==expected_count
+        target.evaluate('localStorage.removeItem(BookingStorage.key)');target.reload()
+        restore_file(target,data.decode('utf-8'))
+        assert target.locator('#confirm-restore').is_enabled()
+        write_count(target);target.locator('#confirm-restore').click()
+        assert target.evaluate('backupWrites')==1 and read_bookings(target)==expected
+        # 1バイトだけ増やした正常データは全件出力を停止し、切り捨てない。
+        target.evaluate("""()=>{const items=BookingStorage.read();items.find(r=>r.name.length<100).name+='A';BookingStorage.write(items);reloadReservations();
+          window.backupURLs=0;URL.createObjectURL=()=>{backupURLs++;throw Error('unexpected download')};}""")
+        raw=target.evaluate('localStorage.getItem(BookingStorage.key)')
+        target.locator('#save-backup').click();target.locator('#confirm-backup').click()
+        assert '5MiB' in target.locator('#backup-error').inner_text()
+        assert target.evaluate('backupURLs')==0 and target.evaluate('localStorage.getItem(BookingStorage.key)')==raw
+        target.locator('#backup-dialog').press('Escape');assert_focus(target,'#save-backup')
+    run_booking_test('STEP8 Medium 上限ちょうどの自アプリ実出力→復元・出力1バイト超過は全件停止',own_backup_size_limit)
+
     print(json.dumps({'sample_events': len(events), 'browser_errors': errors, 'passed': len(passed), 'failed': len(failures), 'test_groups': passed, 'failures': failures}, ensure_ascii=False))
     assert not failures, failures
 

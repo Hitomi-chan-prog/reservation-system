@@ -530,5 +530,18 @@ window.addEventListener('storage', (event) => {
     reloadReservations();
   }
 });
+// 復元後は古い予約確認・日時変更の操作を終了し、全画面を最新保存データから描画する。
+window.addEventListener('reservation-data-restored', () => {
+  bookingContext.end('booking');
+  bookingContext.end('reschedule');
+  selectedRange = null; rescheduleSnapshot = null; rescheduleRange = null; cancelId = null;
+  byId('booking-external-ack').checked = false;
+  byId('reschedule-external-ack').checked = false;
+  byId('reschedule-mode').hidden = true;
+  for (const id of ['reservation-dialog', 'reschedule-dialog', 'cancel-dialog']) {
+    if (byId(id).open) byId(id).close();
+  }
+  reloadReservations();
+});
 reloadReservations();
 renderRoute();
